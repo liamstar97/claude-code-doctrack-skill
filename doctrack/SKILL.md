@@ -26,6 +26,19 @@ Documentation is organized by **audience**:
 
 **This skill requires the Obsidian MCP server to be running.** All documentation operations use `mcp__obsidian__*` tools. If these tools are unavailable, inform the user that the Obsidian MCP connection is required.
 
+## Efficiency & token economy
+
+Every MCP call consumes tokens and latency. Minimize both by choosing the lightest tool for each job:
+
+- **Batch reads**: Use `read_multiple_notes` (up to 10 per call) instead of sequential `read_note` calls. One batch call is far cheaper than ten individual calls.
+- **Metadata before content**: Use `get_frontmatter` or `get_notes_info` to check timestamps, status, or file lists *before* deciding whether to read the full note. Don't load a 500-line feature doc just to check its `last_updated` date.
+- **Search, don't browse**: `search_notes` with `searchFrontmatter=true` is almost always faster than `list_directory` + `read_multiple_notes`. Use search to find what you need; use list only when you need a complete inventory.
+- **Surgical writes**: Use `patch_note` for single-section edits, `update_frontmatter` for metadata-only changes, and `manage_tags` for tag changes. Avoid rewriting entire notes via `write_note` when only a paragraph changed.
+- **Scope your reads**: At session start, load only the docs relevant to the current task — not every feature note in the vault. Read `_project.md` to orient, then selectively load the features/components you'll actually touch.
+- **Combine operations**: When you need to create a note and tag it, do both in quick succession. When updating multiple notes with the same metadata change (e.g., timestamps), batch your `update_frontmatter` calls together rather than interleaving them with reads.
+- **Don't re-read**: If you've already read a note in this session and it hasn't been modified since, don't read it again. Track what you've loaded.
+- **Use `get_notes_info` for existence checks**: To check whether a set of notes exist (e.g., before deciding what to create during init), use `get_notes_info` — it returns existence and timestamps for multiple paths in a single call without loading content.
+
 ## When to use this
 
 **After making code changes**: Any time you add a feature, modify a component, refactor code, or fix a non-trivial bug, update the relevant documentation before finishing your response.
@@ -227,21 +240,24 @@ mcp__obsidian__read_note("{prefix}/_project.md")
 
 If the project config is not found, the project has not been initialized — prompt to run `doctrack init`.
 
-**Step 2: Orient yourself**
+**Step 2: Orient yourself (lightweight)**
 
 ```
 mcp__obsidian__get_vault_stats(recentCount=10)
 ```
-This shows recently modified notes, helping you identify what was worked on in previous sessions.
+This is a lightweight call that shows recently modified notes, helping you identify what was worked on in previous sessions. Do not read all recently modified notes — just use this to inform which specific notes to load in Step 3.
 
-**Step 3: Load relevant context**
+**Step 3: Load relevant context (scoped, not exhaustive)**
+
+Only load docs relevant to the current task — don't read every note in the vault.
 
 Based on what you're about to work on:
-- If the user mentions specific files or features: `mcp__obsidian__search_notes("{feature-name}", searchFrontmatter=true)` to find relevant docs.
-- For broader context: `mcp__obsidian__list_directory("{prefix}/features")` to see all features, then `mcp__obsidian__read_multiple_notes` on the relevant ones (up to 10 at a time).
-- Check references: `mcp__obsidian__list_directory("{prefix}/references")` — scan for user-provided or imported docs relevant to your current task.
+- **Targeted search** (preferred): `mcp__obsidian__search_notes("{feature-name}", searchFrontmatter=true)` to find relevant docs directly. This is the most token-efficient path.
+- **Broader context** (when needed): `mcp__obsidian__list_directory("{prefix}/features")` to see all features, then `mcp__obsidian__read_multiple_notes` on **only the relevant ones** (up to 10 at a time). Don't batch-read all features if you only need two.
+- **Triage with metadata**: If unsure which notes are relevant, use `mcp__obsidian__get_frontmatter` on candidates to check their `files` lists and `last_updated` dates before committing to a full read.
+- **Check references selectively**: `mcp__obsidian__list_directory("{prefix}/references")` — only read references relevant to the area you're working in.
 
-**In a monorepo**: Read the root `_project.md` for the package map. Determine which package you're working in from the current working directory. Read that package's `_package.md`, then load its relevant feature/component docs.
+**In a monorepo**: Read the root `_project.md` for the package map. Determine which package you're working in from the current working directory. Read that package's `_package.md`, then load its relevant feature/component docs. Don't load docs for packages you aren't touching.
 
 ### 3. Update internal docs (features and components)
 
@@ -342,9 +358,9 @@ After creating or modifying any feature/component notes, update `{prefix}/_proje
 - Use `mcp__obsidian__patch_note` to add new rows to the Features table and File Registry
 - Use `mcp__obsidian__update_frontmatter("{prefix}/_project.md", {last_updated: "YYYY-MM-DD"}, merge=true)` to update the timestamp
 
-#### Metadata-only updates
+#### Metadata-only updates (prefer these over full reads/writes)
 
-When you only need to update timestamps or status without changing content:
+When you only need to update timestamps or status without changing content, use the lightweight metadata tool — don't read and rewrite the whole note:
 ```
 mcp__obsidian__update_frontmatter(path, {last_updated: "YYYY-MM-DD"}, merge=true)
 ```
@@ -353,6 +369,12 @@ When checking if a doc might be stale without reading its full content:
 ```
 mcp__obsidian__get_frontmatter(path)
 ```
+
+To check existence and timestamps for multiple notes at once (e.g., "which of these 5 component notes exist?"):
+```
+mcp__obsidian__get_notes_info([path1, path2, path3, ...])
+```
+This is significantly cheaper than reading each note to see if it exists.
 
 ### 4. Update human-readable docs (guides and README)
 
@@ -476,6 +498,8 @@ Do NOT delete notes — they serve as historical context. Use deprecation instea
 
 11. **Use wikilinks for cross-references.** Link between notes using `[[path/to/note|Display Text]]` syntax. This enables Obsidian's graph view and backlinks features, making the documentation navigable and interconnected.
 
+12. **Minimize MCP round-trips.** Every tool call costs tokens and latency. Batch reads with `read_multiple_notes`, use `get_frontmatter`/`get_notes_info` instead of full reads when you only need metadata, and scope your reads to what the current task requires. See the **Efficiency & token economy** section above for the full guidelines. This is not optional — token-conscious operation is a core requirement of doctrack.
+
 ---
 
 ## Project Initialization
@@ -573,6 +597,11 @@ section, use [[features/{other-feature}|Display Name]] links. In component Relat
 sections, populate "Used by" and "Depends on" with wikilinks. These cross-references are
 critical — they help future sessions understand how changes to one feature ripple through
 others.
+
+EFFICIENCY: Minimize MCP round-trips. Write the feature note with frontmatter included
+in a single write_note call (don't write then update_frontmatter separately). Batch your
+component note writes. After writing all notes, tag them in quick succession. Avoid
+reading notes you just wrote — you already know their content.
 ```
 
 #### Phase 3: Build the project config, README, and human docs
@@ -625,7 +654,7 @@ For shared vaults, update `_doctrack.md` at vault root with the new project entr
 
 After all feature notes exist, do a cross-reference pass:
 
-1. **Batch-read feature notes**: Use `mcp__obsidian__read_multiple_notes` (up to 10 at a time) to load all feature docs.
+1. **Batch-read feature notes**: Use `mcp__obsidian__read_multiple_notes` (up to 10 at a time) to load all feature docs. If you already have their content in memory from Phase 2, skip this — don't re-read notes you just wrote.
 
 2. **Check every feature's Dependencies section** — does it list all the other features it imports from? Read the source files' import statements to verify. Ensure wikilinks are correct.
 
@@ -638,7 +667,7 @@ After all feature notes exist, do a cross-reference pass:
 Check that every source file in the project appears in the File Registry:
 
 1. `mcp__obsidian__list_directory("{prefix}/features")` to get all feature notes.
-2. `mcp__obsidian__read_multiple_notes` in batches to collect all `files` entries from frontmatter.
+2. Use `mcp__obsidian__get_frontmatter` on each feature note to extract `files` lists — this is cheaper than reading full note content. Only use `read_multiple_notes` if you need the full content for other reasons.
 3. Compare against the source files discovered in Phase 1.
 4. Files not belonging to any feature likely indicate:
    - A feature you missed (create notes for it)
@@ -815,23 +844,23 @@ After all agents complete their work, the orchestrator should:
 
 ## Obsidian tool reference
 
-Quick reference for which MCP tool to use in each situation:
+Quick reference for which MCP tool to use in each situation. Tools are listed from **lightest to heaviest** — always prefer the lightest tool that gets the job done.
 
-| Tool | When to Use |
-|------|-------------|
-| `mcp__obsidian__search_notes` | Finding docs by feature name, file path, or content. Use `searchFrontmatter=true` for metadata queries. |
-| `mcp__obsidian__read_note` | Reading a single known note by path. |
-| `mcp__obsidian__read_multiple_notes` | Batch loading at session start or during cross-reference passes. Up to 10 notes per call. |
-| `mcp__obsidian__get_frontmatter` | Checking metadata (timestamps, status, files) without loading full content. |
-| `mcp__obsidian__get_notes_info` | Checking existence and timestamps for multiple notes. |
-| `mcp__obsidian__write_note` | Creating new notes. Use `mode: "append"` when adding to `_project.md` concurrently. |
-| `mcp__obsidian__patch_note` | Surgical edits — replacing specific strings in existing notes. Fails on ambiguous matches unless `replaceAll=true`. |
-| `mcp__obsidian__update_frontmatter` | Updating metadata only (timestamps, status, file lists). Use `merge=true` to preserve existing fields. |
-| `mcp__obsidian__manage_tags` | Adding/removing tags. Use `operation: "add"` after creating notes, `"remove"`/`"add"` pair for status changes. |
-| `mcp__obsidian__list_directory` | Browsing vault structure, listing features/components/guides. |
-| `mcp__obsidian__get_vault_stats` | Orientation at session start — vault size and recently modified notes. |
-| `mcp__obsidian__move_note` | Renaming or reorganizing notes (e.g., renaming a feature). |
-| `mcp__obsidian__delete_note` | Only for truly erroneous notes created by mistake. Prefer deprecation over deletion. |
+| Tool | When to Use | Token Cost |
+|------|-------------|------------|
+| `mcp__obsidian__get_frontmatter` | Checking metadata (timestamps, status, files) without loading full content. **Use this to triage before full reads.** | Minimal |
+| `mcp__obsidian__get_notes_info` | Checking existence and timestamps for multiple notes in one call. **Use for bulk existence checks.** | Minimal |
+| `mcp__obsidian__get_vault_stats` | Orientation at session start — vault size and recently modified notes. | Minimal |
+| `mcp__obsidian__manage_tags` | Adding/removing tags. Use `operation: "add"` after creating notes, `"remove"`/`"add"` pair for status changes. | Low |
+| `mcp__obsidian__update_frontmatter` | Updating metadata only (timestamps, status, file lists). Use `merge=true` to preserve existing fields. **Prefer over `patch_note` for metadata changes.** | Low |
+| `mcp__obsidian__search_notes` | Finding docs by feature name, file path, or content. Use `searchFrontmatter=true` for metadata queries. **Prefer over `list_directory` + `read_multiple_notes`.** | Low–Medium |
+| `mcp__obsidian__list_directory` | Browsing vault structure, listing features/components/guides. Use when you need a complete inventory, not when searching. | Low |
+| `mcp__obsidian__patch_note` | Surgical edits — replacing specific strings in existing notes. Fails on ambiguous matches unless `replaceAll=true`. **Prefer over `write_note` for updates.** | Medium |
+| `mcp__obsidian__move_note` | Renaming or reorganizing notes (e.g., renaming a feature). | Medium |
+| `mcp__obsidian__read_note` | Reading a single known note by path. **Use `get_frontmatter` first if you might not need the full content.** | Medium–High |
+| `mcp__obsidian__read_multiple_notes` | Batch loading — up to 10 notes per call. **Always prefer this over sequential `read_note` calls.** | High (but much cheaper than N individual reads) |
+| `mcp__obsidian__write_note` | Creating new notes or full rewrites. Use `mode: "append"` when adding to `_project.md` concurrently. **For updates, prefer `patch_note` or `update_frontmatter` instead.** | High |
+| `mcp__obsidian__delete_note` | Only for truly erroneous notes created by mistake. Prefer deprecation over deletion. | Low |
 
 ---
 
