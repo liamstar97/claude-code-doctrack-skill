@@ -32,12 +32,12 @@ claude install-skill /path/to/doctrack.skill
 Or install from this repository directly:
 
 ```bash
-claude install-skill https://github.com/YOUR_USERNAME/doctrack/releases/latest/download/doctrack.skill
+claude install-skill https://github.com/liamstar97/claude-code-doctrack-skill/releases/latest/download/doctrack.skill
 ```
 
 ### Claude Desktop
 
-1. Download `doctrack.skill` from the [latest release](https://github.com/YOUR_USERNAME/doctrack/releases/latest)
+1. Download `doctrack.skill` from the [latest release](https://github.com/liamstar97/claude-code-doctrack-skill/releases/latest)
 2. Open Claude Desktop
 3. Go to **Settings** > **Skills**
 4. Click **Install Skill** and select the downloaded `.skill` file
