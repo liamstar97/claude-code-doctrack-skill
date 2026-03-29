@@ -2,93 +2,180 @@
 name: doctrack
 description: >
   Maintains persistent codebase knowledge across sessions through structured feature and component
-  documentation. Use this skill whenever you have just made meaningful code changes (new features,
-  modified components, refactoring, bug fixes) to update the project's documentation. Also use it
-  when the user asks to document code, update docs, sync documentation, initialize documentation
-  for an existing project, or when you want to understand the existing codebase structure at the
-  start of a session. This skill should be used proactively after any significant code modification
-  — don't wait for the user to ask. If you changed code, update the docs. Think of it as your
-  long-term memory system: read before working, write after changing. Also use this when a user
-  says "doctrack init", "initialize docs", "document this project", or wants to bootstrap
-  documentation for a codebase that has no .claude_docs/ directory yet.
+  documentation stored in an Obsidian vault via MCP tools. Use this skill whenever you have just
+  made meaningful code changes (new features, modified components, refactoring, bug fixes) to update
+  the project's documentation. Also use it when the user asks to document code, update docs, sync
+  documentation, initialize documentation for an existing project, or when you want to understand
+  the existing codebase structure at the start of a session. This skill should be used proactively
+  after any significant code modification — don't wait for the user to ask. If you changed code,
+  update the docs. Think of it as your long-term memory system: read before working, write after
+  changing. Also use this when a user says "doctrack init", "initialize docs", "document this
+  project", or wants to bootstrap documentation for a codebase that has no doctrack project note
+  in Obsidian yet.
 ---
 
-# Doctrack — Persistent Codebase Knowledge
+# Doctrack — Persistent Codebase Knowledge via Obsidian
 
-You maintain two documentation trees that serve as your long-term memory about the codebase:
+You maintain project documentation in an **Obsidian vault** using the Obsidian MCP tools. The vault is the single source of truth — no documentation files are stored in the project repository (except `README.md` and `CLAUDE.md`).
 
-- **`.claude_docs/`** — Your internal knowledge base. Dense, structured, optimized for you to quickly understand the codebase in future sessions.
-- **`docs/`** — Human-readable documentation. Clean, polished, organized for developers.
+Documentation is organized by **audience**:
+
+- **`features/` and `components/`** — Your internal knowledge base. Dense, structured, optimized for you to quickly understand the codebase in future sessions. (Audience: Claude)
+- **`guides/`** — Human-readable documentation. Clean, polished, organized for developers. (Audience: Human)
+- **`specs/`** — Machine-readable specifications like OpenAPI. (Audience: Machine)
+
+**This skill requires the Obsidian MCP server to be running.** All documentation operations use `mcp__obsidian__*` tools. If these tools are unavailable, inform the user that the Obsidian MCP connection is required.
+
+## Efficiency & token economy
+
+Every MCP call consumes tokens and latency. Minimize both by choosing the lightest tool for each job:
+
+- **Batch reads**: Use `read_multiple_notes` (up to 10 per call) instead of sequential `read_note` calls. One batch call is far cheaper than ten individual calls.
+- **Metadata before content**: Use `get_frontmatter` or `get_notes_info` to check timestamps, status, or file lists *before* deciding whether to read the full note. Don't load a 500-line feature doc just to check its `last_updated` date.
+- **Search, don't browse**: `search_notes` with `searchFrontmatter=true` is almost always faster than `list_directory` + `read_multiple_notes`. Use search to find what you need; use list only when you need a complete inventory.
+- **Surgical writes**: Use `patch_note` for single-section edits, `update_frontmatter` for metadata-only changes, and `manage_tags` for tag changes. Avoid rewriting entire notes via `write_note` when only a paragraph changed.
+- **Scope your reads**: At session start, load only the docs relevant to the current task — not every feature note in the vault. Read `_project.md` to orient, then selectively load the features/components you'll actually touch.
+- **Combine operations**: When you need to create a note and tag it, do both in quick succession. When updating multiple notes with the same metadata change (e.g., timestamps), batch your `update_frontmatter` calls together rather than interleaving them with reads.
+- **Don't re-read**: If you've already read a note in this session and it hasn't been modified since, don't read it again. Track what you've loaded.
+- **Use `get_notes_info` for existence checks**: To check whether a set of notes exist (e.g., before deciding what to create during init), use `get_notes_info` — it returns existence and timestamps for multiple paths in a single call without loading content.
 
 ## When to use this
 
 **After making code changes**: Any time you add a feature, modify a component, refactor code, or fix a non-trivial bug, update the relevant documentation before finishing your response.
 
-**At the start of a session**: When you begin working on a codebase that has a `.claude_docs/` directory, read `.claude_docs/index.md` first to orient yourself. This is your memory from previous sessions — use it.
+**At the start of a session**: Search Obsidian for the project's `_project.md` note to orient yourself. This is your memory from previous sessions — use it. If you find doctrack notes for this project, load the relevant ones before starting work.
 
 **When the user asks**: If the user says anything about documenting, updating docs, syncing docs, or generating documentation.
 
-**To initialize a project**: When the user says "doctrack init" or asks to document an existing project that has no `.claude_docs/` yet. See the **Project Initialization** section below.
+**To initialize a project**: When the user says "doctrack init" or asks to document an existing project that has no doctrack project note in Obsidian yet. See the **Project Initialization** section below.
 
 **Do NOT use this for**: Trivial formatting changes, comment-only edits, or when you're just reading/exploring code without modifying it.
 
-## Directory structure
+## Vault structure
+
+All paths below use `{prefix}` which resolves to:
+- **Single-project vault**: empty (notes at vault root)
+- **Shared vault**: `projects/{project-name}`
+
+The vault layout is determined during `doctrack init` and stored in `_project.md` frontmatter.
+
+### Single-project vault
 
 ```
-project_root/
-├── .claude_docs/                          # Your internal knowledge base
-│   ├── index.md                           # Master index — always read this first
-│   ├── references/                        # Reference documents
-│   │   ├── imported/                      # Existing project docs imported here
-│   │   └── user/                          # User-provided reference materials
-│   ├── {feature-name}/
-│   │   ├── feature.md                     # Feature-level overview
-│   │   └── components/
-│   │       ├── {component-name}.md        # Component-level detail
-│   │       └── ...
-│   └── ...
-└── docs/                                  # Human-readable documentation
-    ├── legacy/                            # Pre-existing docs moved here during init
-    ├── architecture.md                    # System architecture overview
-    ├── {topic}.md                         # Topic-based docs
-    └── ...
+vault-root/
+├── _project.md                     # Project config — always read this first
+├── features/
+│   └── {feature-name}.md           # Feature overviews (audience: claude)
+├── components/
+│   └── {feature}/{component}.md    # Component details (audience: claude)
+├── guides/
+│   ├── architecture.md             # System architecture (audience: human)
+│   ├── development.md              # Build/run/test (audience: human)
+│   ├── api.md                      # API reference (audience: human)
+│   └── {topic}.md                  # Topic guides (audience: human)
+├── specs/
+│   └── openapi.md                  # OpenAPI spec in code block (audience: machine)
+├── references/
+│   ├── imported/                   # Pre-existing docs imported during init
+│   └── user/                       # User-provided reference materials
+└── legacy/                         # Pre-existing docs preserved during init
 ```
 
-### Reference documents (`.claude_docs/references/`)
+### Shared (multi-project) vault
 
-This directory holds supplementary documentation that you should consult when working on the codebase:
+```
+vault-root/
+├── _doctrack.md                    # Global config — lists all tracked projects
+└── projects/
+    └── {project-name}/
+        ├── _project.md
+        ├── features/ components/ guides/ specs/ references/ legacy/
+        └── (same structure as single-project)
+```
 
-- **`references/imported/`** — Existing project documentation that was present before doctrack was initialized (e.g., original README files, wiki exports, design docs, ADRs). During init, copy these here for your internal use. If the originals lived in a `docs/` directory, move them to `docs/legacy/` so they're preserved for humans but out of the way of new doctrack-generated docs. This avoids duplication — `references/imported/` is your copy, `docs/legacy/` is the human-accessible archive.
+### Monorepo (within a project)
 
-- **`references/user/`** — Documents the user has added for you to reference. These might be API docs for external services, design specs, style guides, compliance requirements, or anything else relevant to the project. Users can drop files here at any time.
+```
+{prefix}/
+├── _project.md                     # Root config: package map, cross-package deps
+├── packages/
+│   └── {package-name}/
+│       ├── _package.md             # Package-level config
+│       ├── features/ components/ guides/ specs/
+│       └── ...
+├── guides/
+│   └── architecture.md             # Root-level monorepo architecture
+└── references/
+```
 
-When starting a session, after reading `index.md`, check if `references/` exists and scan its contents. These documents provide context that may not be captured in feature/component docs — design rationale, external API contracts, business requirements, etc. Reference them in your feature docs when relevant (e.g., "See `references/user/stripe-api-guide.md` for webhook signature verification details").
+### Reference notes (`{prefix}/references/`)
+
+This directory holds supplementary documentation you should consult when working on the codebase:
+
+- **`references/imported/`** — Existing project documentation that was present before doctrack was initialized (e.g., original README files, wiki exports, design docs, ADRs). During init, these are written to Obsidian for your internal use.
+
+- **`references/user/`** — Documents the user has added for you to reference. These might be API docs for external services, design specs, style guides, compliance requirements, or anything else relevant to the project.
+
+When starting a session, after reading `_project.md`, check for references: `mcp__obsidian__list_directory("{prefix}/references")`. These provide context not captured in feature/component docs — design rationale, external API contracts, business requirements, etc. Reference them in feature docs using wikilinks when relevant (e.g., "See [[references/user/stripe-api-guide|Stripe API Guide]] for webhook signature verification details").
+
+## Tag taxonomy
+
+Every doctrack-managed note gets **three required tags** applied via `mcp__obsidian__manage_tags`:
+
+| Category | Tags | Purpose |
+|----------|------|---------|
+| **Type** | `doctrack/type/feature`, `doctrack/type/component`, `doctrack/type/guide`, `doctrack/type/reference`, `doctrack/type/spec`, `doctrack/type/index`, `doctrack/type/legacy` | What kind of doc |
+| **Status** | `doctrack/status/active`, `doctrack/status/deprecated`, `doctrack/status/draft` | Current state |
+| **Audience** | `doctrack/audience/claude`, `doctrack/audience/human`, `doctrack/audience/machine` | Who it's for |
+
+Additional tags for multi-project and monorepo contexts:
+
+| Category | Tags | When |
+|----------|------|------|
+| **Project** | `doctrack/project/{name}` | Shared vaults only |
+| **Package** | `doctrack/package/{name}` | Monorepos only |
+
+**Rule**: If you need to search/filter by it, make it a tag. If you need to read its value, put it in frontmatter. Tags and frontmatter complement each other.
 
 ## Step-by-step workflow
 
-### 1. Bootstrap (first time only)
+### 1. First session setup (first time only)
 
-If `.claude_docs/` doesn't exist yet and you're just making a single change (not initializing the whole project), create a minimal structure.
+If the project has no doctrack notes in Obsidian yet and you're just making a single change (not initializing the whole project), create a minimal structure.
 
-**Determine the right location for `.claude_docs/`:**
-- **Standard project**: Create `.claude_docs/` at the project root.
-- **Monorepo**: If you're working inside a package (e.g., `packages/api/src/...`), create `.claude_docs/` inside that package (e.g., `packages/api/.claude_docs/`). Also create the root `.claude_docs/index.md` if it doesn't exist, with a basic package map. Check for monorepo indicators: `workspaces` in root `package.json`, `pnpm-workspace.yaml`, `lerna.json`, `turbo.json`, `nx.json`.
+**Step 1: Determine vault layout**
 
-```
-.claude_docs/
-└── index.md
-```
+Check if this is a shared or single-project vault:
+1. Use `mcp__obsidian__list_directory("/")` to check for a `projects/` directory or `_doctrack.md` note.
+2. If `_doctrack.md` exists or `projects/` exists → this is a shared vault. Set `{prefix}` to `projects/{project-name}`.
+3. Otherwise → this is a single-project vault. Set `{prefix}` to empty (vault root).
 
-Initialize `index.md` with this template:
+**Step 2: Detect project name**
+
+Extract the project name from `package.json` `name` field, the project directory name, or ask the user.
+
+**Step 3: Create the project config note**
+
+Use `mcp__obsidian__write_note` to create `{prefix}/_project.md` with this template:
 
 ```markdown
-# Project Documentation Index
+---
+project: {project-name}
+type: index
+cwd: {filesystem-path-to-project}
+vault_layout: single|shared
+monorepo: false
+initialized: YYYY-MM-DD
+last_updated: YYYY-MM-DD
+---
+
+# {Project Name}
 
 > Auto-maintained by doctrack. Last updated: YYYY-MM-DD
 
 ## Features
 
-| Feature | Path | Description | Status | Last Updated |
+| Feature | Note | Description | Status | Last Updated |
 |---------|------|-------------|--------|--------------|
 
 ## File Registry
@@ -97,27 +184,88 @@ Initialize `index.md` with this template:
 |------------|---------|-----------|------|
 ```
 
-Also create `docs/` if it doesn't exist (co-located with the `.claude_docs/` — at package level for monorepos, at root for standard projects).
+Then tag it:
+```
+mcp__obsidian__manage_tags("{prefix}/_project.md", "add", ["doctrack/type/index", "doctrack/status/active", "doctrack/audience/claude"])
+```
+
+For shared vaults, also update or create `_doctrack.md` at vault root with the new project entry.
+
+**Step 4: Write doctrack instructions to the project's `CLAUDE.md`**
+
+Read the project's existing `CLAUDE.md` from the filesystem (if any) using the `Read` tool. If it already contains a `# Doctrack` section, replace that section in place using the `Edit` tool. If not, append the doctrack section to the end using the `Edit` tool (or create the file with `Write` if it doesn't exist).
+
+Write this content (substituting the actual project name and vault prefix):
+
+```markdown
+# Doctrack
+
+This project's documentation is maintained in an Obsidian vault using the doctrack skill.
+Project: `{project-name}` | Vault path: `{prefix}/`
+
+## Before starting work
+- Search Obsidian for this project's docs: the project config note is at `{prefix}/_project.md`
+- Read relevant feature and component notes to understand the area you'll be working in
+- Check `{prefix}/references/` for any supplementary documentation
+- Use the doctrack skill to load and review documentation before planning any implementation
+
+## After making code changes
+- Use the doctrack skill to update documentation for any code you modified
+- Update the relevant feature/component notes in Obsidian
+- Update the project config note (`{prefix}/_project.md`) if you added new features or files
+- Update human-readable guides in `{prefix}/guides/` if the changes affect developer-facing documentation
+- Always update `last_updated` frontmatter timestamps on modified notes
+```
+
+This ensures that future Claude Code sessions in this project will automatically discover and use doctrack documentation.
+
+**Monorepo detection**: Check for monorepo indicators (`workspaces` in `package.json`, `pnpm-workspace.yaml`, `lerna.json`, `turbo.json`, `nx.json`). If detected, set `monorepo: true` in frontmatter and see the **Monorepo** sections below.
 
 For full project initialization (documenting an entire existing codebase), see the **Project Initialization** section below instead.
 
-### 2. Read existing documentation
+### 2. Read existing documentation (session startup)
 
-**Always read `.claude_docs/index.md` first.** This tells you what's already documented and prevents duplicate or conflicting documentation.
+Use a search-first approach — don't rely on reading a single index file.
 
-**In a monorepo**: Find the nearest `.claude_docs/` by walking up from your current working directory. If you're inside a package, read that package's `.claude_docs/index.md` first, then the root `.claude_docs/index.md` for cross-package context. If you're at the repo root, read the root index to understand which packages exist and their relationships.
+**Step 1: Find the project config**
 
-Then check if `.claude_docs/references/` exists — scan its contents for any user-provided or imported docs that may be relevant to your current task.
+Search for the project's config note:
+```
+mcp__obsidian__search_notes("{project-name}", searchFrontmatter=true, limit=5)
+```
+Or read it directly if you know the path:
+```
+mcp__obsidian__read_note("{prefix}/_project.md")
+```
 
-Then read the specific feature/component docs relevant to whatever code you just changed. The index tells you which docs exist and where they are.
+If the project config is not found, the project has not been initialized — prompt to run `doctrack init`.
 
-### 3. Update internal docs (`.claude_docs/`)
+**Step 2: Orient yourself (lightweight)**
+
+```
+mcp__obsidian__get_vault_stats(recentCount=10)
+```
+This is a lightweight call that shows recently modified notes, helping you identify what was worked on in previous sessions. Do not read all recently modified notes — just use this to inform which specific notes to load in Step 3.
+
+**Step 3: Load relevant context (scoped, not exhaustive)**
+
+Only load docs relevant to the current task — don't read every note in the vault.
+
+Based on what you're about to work on:
+- **Targeted search** (preferred): `mcp__obsidian__search_notes("{feature-name}", searchFrontmatter=true)` to find relevant docs directly. This is the most token-efficient path.
+- **Broader context** (when needed): `mcp__obsidian__list_directory("{prefix}/features")` to see all features, then `mcp__obsidian__read_multiple_notes` on **only the relevant ones** (up to 10 at a time). Don't batch-read all features if you only need two.
+- **Triage with metadata**: If unsure which notes are relevant, use `mcp__obsidian__get_frontmatter` on candidates to check their `files` lists and `last_updated` dates before committing to a full read.
+- **Check references selectively**: `mcp__obsidian__list_directory("{prefix}/references")` — only read references relevant to the area you're working in.
+
+**In a monorepo**: Read the root `_project.md` for the package map. Determine which package you're working in from the current working directory. Read that package's `_package.md`, then load its relevant feature/component docs. Don't load docs for packages you aren't touching.
+
+### 3. Update internal docs (features and components)
 
 Be surgical — only update docs for code that actually changed. Don't rewrite everything.
 
-#### Feature docs: `.claude_docs/{feature}/feature.md`
+#### Feature notes: `{prefix}/features/{feature-name}.md`
 
-Use this template:
+Create with `mcp__obsidian__write_note`, update with `mcp__obsidian__patch_note`. Use this template:
 
 ```markdown
 ---
@@ -145,7 +293,7 @@ Data flow, state management approach, important patterns.
 - `src/path/to/other.ts` — Utility functions for Y
 
 ## Dependencies
-- **Internal**: auth module, database layer
+- **Internal**: [[features/auth|Authentication]], [[features/database|Database layer]]
 - **External**: express, lodash
 
 ## API Surface
@@ -156,7 +304,12 @@ Anything important for future sessions: gotchas, technical debt, planned changes
 non-obvious behavior.
 ```
 
-#### Component docs: `.claude_docs/{feature}/components/{component}.md`
+After creating a new feature note, always tag it:
+```
+mcp__obsidian__manage_tags("{prefix}/features/{feature-name}.md", "add", ["doctrack/type/feature", "doctrack/status/active", "doctrack/audience/claude"])
+```
+
+#### Component notes: `{prefix}/components/{feature}/{component}.md`
 
 ```markdown
 ---
@@ -187,103 +340,197 @@ How it works internally. Important algorithms, state transitions, data transform
 Be dense — this is for you, not humans.
 
 ## Relationships
-- **Used by**: list of components/features that depend on this
-- **Depends on**: list of components/features this uses
+- **Used by**: [[features/auth|Authentication]], [[components/auth/session-manager|Session Manager]]
+- **Depends on**: [[features/database|Database layer]]
 
 ## Known Issues
 - Any bugs, technical debt, or TODOs
 ```
 
-#### Update the index
+After creating a new component note, tag it:
+```
+mcp__obsidian__manage_tags("{prefix}/components/{feature}/{component}.md", "add", ["doctrack/type/component", "doctrack/status/active", "doctrack/audience/claude"])
+```
 
-After creating or modifying any feature/component docs, update `.claude_docs/index.md`:
-- Add new rows to the Features table
-- Add new rows to the File Registry
-- Update the "Last Updated" timestamp
+#### Update the project config
 
-### 4. Update human-readable docs (`docs/` and `README.md`)
+After creating or modifying any feature/component notes, update `{prefix}/_project.md`:
+- Use `mcp__obsidian__patch_note` to add new rows to the Features table and File Registry
+- Use `mcp__obsidian__update_frontmatter("{prefix}/_project.md", {last_updated: "YYYY-MM-DD"}, merge=true)` to update the timestamp
 
-After updating internal docs, update the human-facing documentation. These docs are meant for developers — they should be descriptive, visual, and immediately useful. Think of them as the "front page" of the project that someone reads before diving into code.
+#### Metadata-only updates (prefer these over full reads/writes)
+
+When you only need to update timestamps or status without changing content, use the lightweight metadata tool — don't read and rewrite the whole note:
+```
+mcp__obsidian__update_frontmatter(path, {last_updated: "YYYY-MM-DD"}, merge=true)
+```
+
+When checking if a doc might be stale without reading its full content:
+```
+mcp__obsidian__get_frontmatter(path)
+```
+
+To check existence and timestamps for multiple notes at once (e.g., "which of these 5 component notes exist?"):
+```
+mcp__obsidian__get_notes_info([path1, path2, path3, ...])
+```
+This is significantly cheaper than reading each note to see if it exists.
+
+### 4. Update human-readable docs (guides and README)
+
+After updating internal docs, update the human-facing documentation. These are for developers — descriptive, visual, and immediately useful.
 
 #### README files
 
-**Every project and sub-project must have a `README.md` at its root.** The README is the front page for humans and git repositories. It should include:
+**Every project and sub-project must have a `README.md` at its root in the project filesystem.** The README is the front page for humans and git hosting platforms (GitHub, GitLab). Use the standard `Write` tool (not Obsidian) to write this file. It should include:
 - Project name and a concise description of what it does
 - Tech stack and key dependencies
 - Quick start: how to build, run, and test the project
-- Links to detailed docs in `docs/` for deeper reading
+- Note that detailed docs are maintained in the project's Obsidian vault
 - For monorepos: the root README maps all sub-projects and links to each sub-project's README
 
-#### `docs/` directory
+#### Guide notes in Obsidian (`{prefix}/guides/`)
 
-Create descriptive, feature-focused documents — not just a single architecture file. Each major feature or subsystem should get its own doc. These should be higher level than `.claude_docs/` but still descriptive enough that a developer can understand how features work, what mechanisms are involved, and what technologies are used.
+Create descriptive, feature-focused notes — not just a single architecture file. Each major feature or subsystem should get its own guide. These should be higher level than feature/component notes but still descriptive enough that a developer can understand how features work.
 
 **What to include:**
-- **Architecture overview** (`docs/architecture.md`): High-level system design, how features connect, data flow. Use ASCII art generously for visual explanations — flow diagrams, sequence diagrams, state machines, data flow charts, component relationship maps. These make docs immediately scannable and help developers build mental models fast. The only ASCII art to avoid is directory/file tree listings (developers can search the codebase themselves).
-- **Feature docs** (`docs/{feature}.md`): One per major feature. Explain what it does, how it works, key mechanisms and patterns, and important configuration. Include code examples only when they genuinely clarify something that prose cannot (e.g., a non-obvious API usage pattern or a tricky integration point). Use ASCII art diagrams liberally — flow charts, sequence diagrams, state transitions, data pipelines. Tables and structured sections help too.
-- **API docs** (`docs/api.md`): If there are APIs, document endpoints and usage in human-readable form.
-- **OpenAPI spec** (`docs/openapi.yaml`): If the project exposes REST APIs, generate or update an OpenAPI 3.0+ spec. This is more useful to developers than prose — it can be imported into Postman, used for client generation, and rendered by Swagger UI. Include all endpoints, request/response schemas, auth requirements, and error responses. Keep it in sync with the actual routes.
-- **Build, run, and test** (`docs/development.md` or in README): How to set up the dev environment, build the project, run it locally, and run tests (if tests exist). Include actual commands.
-- **Glossary** (`docs/glossary.md`): If the project has domain-specific terminology.
+- **Architecture overview** (`{prefix}/guides/architecture.md`): High-level system design, how features connect, data flow. Use ASCII art generously — flow diagrams, sequence diagrams, state machines, data flow charts. Avoid ASCII directory/file tree listings.
+- **Feature guides** (`{prefix}/guides/{feature}.md`): One per major feature. Explain what it does, how it works, key mechanisms and patterns. Use diagrams and tables liberally. Include code examples only when they genuinely clarify something prose cannot.
+- **API docs** (`{prefix}/guides/api.md`): If there are APIs, document endpoints and usage.
+- **Build, run, and test** (`{prefix}/guides/development.md`): How to set up the dev environment, build, run, and test. Include actual commands.
+- **Glossary** (`{prefix}/guides/glossary.md`): If the project has domain-specific terminology.
+
+Create each guide with `mcp__obsidian__write_note` and tag it:
+```
+mcp__obsidian__manage_tags(path, "add", ["doctrack/type/guide", "doctrack/status/active", "doctrack/audience/human"])
+```
 
 **Style guidelines:**
 - Polished and well-written — humans will read these
-- Use clear headings, tables, and ASCII art diagrams liberally (flow charts, sequence diagrams, state machines, data flow, component maps)
+- Use clear headings, tables, and ASCII art diagrams liberally
 - Include code examples sparingly — only when they genuinely clarify something
-- Do NOT include ASCII directory/file tree listings — that info is easily discoverable via the codebase
-- Maintain a consistent tone across all docs
+- Do NOT include ASCII directory/file tree listings
+- Maintain a consistent tone across all guides
+- Use `[[wikilinks]]` to cross-reference other notes in the vault
 
-Only create/update human docs that are relevant to the changes made. Don't create empty placeholder docs.
+Only create/update guides that are relevant to the changes made. Don't create empty placeholder notes.
 
-When updating API endpoints, always update both `docs/api.md` and `docs/openapi.yaml` together. If the project doesn't have REST APIs (e.g., it's a library or CLI tool), skip the OpenAPI spec.
+#### Spec notes in Obsidian (`{prefix}/specs/`)
+
+If the project exposes REST APIs, maintain an OpenAPI spec as an Obsidian note:
+
+```markdown
+---
+type: spec
+format: openapi
+last_updated: YYYY-MM-DD
+status: active
+---
+
+# OpenAPI Specification
+
+```yaml
+openapi: "3.0.0"
+info:
+  title: ...
+...
+```
+```
+
+Tag it: `doctrack/type/spec`, `doctrack/status/active`, `doctrack/audience/machine`.
+
+If the OpenAPI spec needs to be consumed by tools (Swagger UI, code generators, CI validation), also write it to the project filesystem at `docs/openapi.yaml` using the standard `Write` tool — but only if the user requests this. By default, specs live in Obsidian only.
+
+When updating API endpoints, always update both `{prefix}/guides/api.md` and `{prefix}/specs/openapi.md` together.
 
 ### 5. Deprecation handling
 
-When code is removed or replaced:
-- Set `status: deprecated` in the frontmatter
-- Add a deprecation note explaining what replaced it and when
-- Do NOT delete the doc — it serves as historical context
-- Update the index to reflect the deprecated status
+When code is removed or replaced, use Obsidian's metadata tools:
+
+1. Update frontmatter:
+   ```
+   mcp__obsidian__update_frontmatter(path, {status: "deprecated", deprecated_date: "YYYY-MM-DD", replaced_by: "new-feature-name"}, merge=true)
+   ```
+
+2. Update tags:
+   ```
+   mcp__obsidian__manage_tags(path, "remove", ["doctrack/status/active"])
+   mcp__obsidian__manage_tags(path, "add", ["doctrack/status/deprecated"])
+   ```
+
+3. Add a deprecation notice to the content:
+   ```
+   mcp__obsidian__patch_note(path, "# Feature Name", "# Feature Name\n\n> **DEPRECATED** (YYYY-MM-DD): Replaced by [[features/new-feature|New Feature]]. Kept for historical context.")
+   ```
+
+4. Update `_project.md` to reflect the deprecated status.
+
+Do NOT delete notes — they serve as historical context. Use deprecation instead.
 
 ## Naming conventions
 
-- **Feature directories**: lowercase, kebab-case (e.g., `user-authentication`, `payment-processing`)
-- **Component files**: lowercase, kebab-case matching the component name (e.g., `token-validator.md`, `payment-gateway.md`)
-- **Human docs**: lowercase, kebab-case, descriptive (e.g., `getting-started.md`, `api-reference.md`)
+- **Feature notes**: lowercase, kebab-case (e.g., `user-authentication.md`, `payment-processing.md`)
+- **Component notes**: lowercase, kebab-case matching the component name (e.g., `token-validator.md`, `payment-gateway.md`)
+- **Guide notes**: lowercase, kebab-case, descriptive (e.g., `getting-started.md`, `api-reference.md`)
+- **Vault paths**: always use forward slashes, relative to vault root
 
 ## Important principles
 
-1. **Read before writing.** Always check what docs already exist before creating new ones. Prevent duplicates.
+1. **Read before writing.** Always search for existing notes before creating new ones. Use `mcp__obsidian__search_notes` to check. Prevent duplicates.
 
-2. **Paths are relative.** Always use paths relative to the project root. Never absolute paths.
+2. **Source paths are relative.** File paths in frontmatter (the `files` field) are always relative to the project's filesystem root. Vault paths are relative to vault root.
 
-3. **Dense internal docs.** Your `.claude_docs/` files are for you — pack them with information. Include the "why" behind decisions, not just the "what."
+3. **Dense internal docs.** Your `features/` and `components/` notes are for you — pack them with information. Include the "why" behind decisions, not just the "what."
 
-4. **Clean human docs.** The `docs/` files are for developers — keep them readable, well-organized, and free of internal implementation noise.
+4. **Clean human docs.** The `guides/` notes are for developers — keep them readable, well-organized, and free of internal implementation noise.
 
-5. **Incremental updates.** Don't rewrite entire docs when only one section changed. Edit surgically.
+5. **Incremental updates.** Don't rewrite entire notes when only one section changed. Use `mcp__obsidian__patch_note` for surgical edits.
 
-6. **Timestamp everything.** Always update `last_updated` in frontmatter when modifying a doc. This helps you prioritize which docs might be stale.
+6. **Timestamp everything.** Always use `mcp__obsidian__update_frontmatter` to update `last_updated` when modifying a note. This helps you prioritize which docs might be stale.
 
 7. **Feature boundaries matter.** Think carefully about what constitutes a "feature" vs a "component." A feature is a cohesive unit of functionality (e.g., "authentication", "search"). A component is a distinct part within a feature (e.g., "token-validator", "search-indexer").
+
+8. **Tag consistently.** Every note gets type + status + audience tags. In shared vaults, also project tags. In monorepos, also package tags. Apply tags immediately after creating a note.
+
+9. **Search first.** Use `mcp__obsidian__search_notes` before `mcp__obsidian__list_directory` to find docs. Search is faster and more flexible, especially for large vaults.
+
+10. **Obsidian is the source of truth.** No documentation files in the project repo except `README.md` and `CLAUDE.md` (and optional machine-readable specs if the user opts in). Everything else lives in Obsidian.
+
+11. **Use wikilinks for cross-references.** Link between notes using `[[path/to/note|Display Text]]` syntax. This enables Obsidian's graph view and backlinks features, making the documentation navigable and interconnected.
+
+12. **Minimize MCP round-trips.** Every tool call costs tokens and latency. Batch reads with `read_multiple_notes`, use `get_frontmatter`/`get_notes_info` instead of full reads when you only need metadata, and scope your reads to what the current task requires. See the **Efficiency & token economy** section above for the full guidelines. This is not optional — token-conscious operation is a core requirement of doctrack.
 
 ---
 
 ## Project Initialization
 
-Use this when a codebase already has significant code but no `.claude_docs/` directory. The user might say "doctrack init", "initialize docs", "document this project", or similar.
+Use this when a codebase already has significant code but no doctrack project note in Obsidian. The user might say "doctrack init", "initialize docs", "document this project", or similar.
 
 This is fundamentally different from the incremental workflow above — you're documenting an entire existing codebase rather than updating docs after a single change.
+
+### Pre-init: Vault configuration
+
+Before documenting anything, determine the vault layout.
+
+1. **Ask the user**: "Is this Obsidian vault shared across multiple projects, or dedicated to this one project?"
+   - If shared: set `{prefix}` to `projects/{project-name}`. Check if `_doctrack.md` exists at vault root; create it if not.
+   - If single-project: set `{prefix}` to empty (vault root).
+
+2. **Detect project name**: From `package.json` `name` field, the directory name, or ask the user.
+
+3. **Check for existing doctrack data**: `mcp__obsidian__search_notes("doctrack/type/index", searchFrontmatter=true)` to see if this project was already initialized. If found, warn the user and ask whether to re-initialize or abort.
 
 ### Init workflow
 
 #### Phase 1: Discover the project structure
 
+This phase reads the **source code on the filesystem** using standard tools (Read, Glob, Grep) — not Obsidian.
+
 1. **Read config files** to understand the tech stack:
    - `package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, etc.
    - Framework config files (next.config.js, vite.config.ts, etc.)
    - Look at the dependency list — it reveals what the project does
-   - **Check for monorepo indicators**: `workspaces` in `package.json`, `pnpm-workspace.yaml`, `lerna.json`, `turbo.json`, `nx.json`, or a `packages/`/`apps/`/`services/` directory with multiple sub-projects. If this is a monorepo, follow the **Init for monorepos** section below instead of continuing with Phases 2-4 directly.
+   - **Check for monorepo indicators**: `workspaces` in `package.json`, `pnpm-workspace.yaml`, `lerna.json`, `turbo.json`, `nx.json`, or a `packages/`/`apps/`/`services/` directory with multiple sub-projects. If this is a monorepo, follow the **Init for monorepos** section below.
 
 2. **Map the directory tree** — use glob patterns to understand the layout:
    - `src/**/*.{ts,js,py,go,rs}` (or whatever the language is)
@@ -295,10 +542,9 @@ This is fundamentally different from the incremental workflow above — you're d
    - Doc directories (`docs/`, `documentation/`, `wiki/`)
    - Architecture Decision Records (`adr/`, `decisions/`)
    - Design docs, API specs, runbooks
-   - **For standard projects**: Copy these into `.claude_docs/references/imported/`, preserving filenames.
-   - **For monorepos**: Import root-level docs (root README, root docs/) into the root `.claude_docs/references/imported/`. Import package-specific docs (e.g., `packages/api/README.md`, `packages/api/docs/`) into that package's `.claude_docs/references/imported/`. This keeps references co-located with the code they describe.
-   - **Handle pre-existing `docs/` directories**: If a `docs/` directory already exists with content, move (not copy) its contents into `docs/legacy/` to preserve them while making room for doctrack-generated documentation. This prevents duplication — the originals live in `docs/legacy/` for human reference, and copies go into `.claude_docs/references/imported/` for your internal use. Do not leave pre-existing docs in both `docs/` and `references/imported/`.
-   - These are your source material for understanding the project and should be referenced from feature docs where relevant.
+   - **Write each found doc to Obsidian**: `mcp__obsidian__write_note("{prefix}/references/imported/{filename}.md", content, frontmatter={type: "reference", source: "imported", original_path: "..."})`. Tag them with `doctrack/type/reference`, `doctrack/status/active`, `doctrack/audience/claude`.
+   - **Preserve pre-existing docs for humans**: Also write them to `{prefix}/legacy/` and tag with `doctrack/type/legacy`, `doctrack/status/active`, `doctrack/audience/human`.
+   - These are your source material for understanding the project and should be referenced from feature docs using wikilinks where relevant.
 
 4. **Identify feature boundaries** — this is the critical thinking step. Look for:
    - Directory-based groupings (e.g., `src/auth/`, `src/payments/`)
@@ -310,116 +556,171 @@ This is fundamentally different from the incremental workflow above — you're d
 
 For large projects, use subagents to document features in parallel. Each subagent should:
 
-1. Receive: the feature name, the list of files belonging to that feature, and the doctrack templates
-2. Read all source files for that feature
-3. Write the feature doc AND component docs following the templates
-4. Return: the paths of docs created and the file registry entries
+1. Receive: the feature name, the list of files belonging to that feature, the doctrack templates, and the Obsidian vault prefix
+2. Read all source files for that feature (from the filesystem using Read)
+3. Write the feature note AND component notes to Obsidian following the templates
+4. Tag all created notes with the appropriate doctrack tags
+5. Return: the vault paths of notes created and the file registry entries
 
-**Component docs are not optional.** A feature with multiple source files should have component docs — one for each distinct logical unit (a service class, a middleware, a data model, a utility module, etc.). The feature doc describes the big picture; component docs describe the internals of each piece. If a feature has only one source file, a component doc is not needed. But features with 2+ files almost always warrant components.
+**Component notes are not optional.** A feature with multiple source files should have component notes — one for each distinct logical unit (a service class, a middleware, a data model, a utility module, etc.). The feature note describes the big picture; component notes describe the internals. If a feature has only one source file, a component note is not needed. But features with 2+ files almost always warrant components.
 
 Spawn one subagent per feature. Give each subagent this context:
 ```
-You are documenting the "{feature-name}" feature for doctrack.
+You are documenting the "{feature-name}" feature for doctrack in Obsidian.
 
+Vault prefix: {prefix}
 Files to analyze:
 - {list of source files}
 
-Other features in this project (for cross-referencing):
+Other features in this project (for cross-referencing via [[wikilinks]]):
 - {list of other feature names and their file paths}
 
-Write these docs following the doctrack templates:
-1. .claude_docs/{feature}/feature.md (the feature overview)
-2. .claude_docs/{feature}/components/{component}.md (one per logical component)
+Write these notes to Obsidian using mcp__obsidian__write_note:
+1. {prefix}/features/{feature-name}.md (the feature overview)
+2. {prefix}/components/{feature-name}/{component}.md (one per logical component)
 
-You MUST create component docs for features with multiple source files. Each distinct
-class, service, middleware, model, or utility module should get its own component doc
-with type: component in the frontmatter. The feature doc covers the big picture;
-component docs cover the internals of each piece.
+After writing each note, tag it with mcp__obsidian__manage_tags:
+- Feature notes: ["doctrack/type/feature", "doctrack/status/active", "doctrack/audience/claude"]
+- Component notes: ["doctrack/type/component", "doctrack/status/active", "doctrack/audience/claude"]
+
+You MUST create component notes for features with multiple source files. Each distinct
+class, service, middleware, model, or utility module should get its own component note.
+The feature note covers the big picture; component notes cover the internals of each piece.
 
 Use the standard frontmatter format. Be thorough — this is the initial documentation
 that future sessions will rely on. Focus on architecture, key decisions, file roles,
 dependencies, and anything non-obvious about how the code works.
 
-IMPORTANT: Trace imports and function calls to identify cross-feature dependencies.
-In the Dependencies section, explicitly list every other feature this one imports from
-or depends on. In component docs, populate the "Used by" and "Depends on" fields in
-the Relationships section. These cross-references are critical — they help future
-sessions understand how changes to one feature ripple through others.
+IMPORTANT: Use [[wikilinks]] for all cross-references to other features and components.
+Trace imports and function calls to identify cross-feature dependencies. In the Dependencies
+section, use [[features/{other-feature}|Display Name]] links. In component Relationships
+sections, populate "Used by" and "Depends on" with wikilinks. These cross-references are
+critical — they help future sessions understand how changes to one feature ripple through
+others.
+
+EFFICIENCY: Minimize MCP round-trips. Write the feature note with frontmatter included
+in a single write_note call (don't write then update_frontmatter separately). Batch your
+component note writes. After writing all notes, tag them in quick succession. Avoid
+reading notes you just wrote — you already know their content.
 ```
 
-#### Phase 3: Build the index, README, and human docs
+#### Phase 3: Build the project config, README, and human docs
 
-After all feature docs are written:
+After all feature notes are written:
 
-1. **Build `.claude_docs/index.md`** — aggregate all features, components, and file mappings into the master index. The index does not need YAML frontmatter — it's a table-of-contents file, not a feature/component doc.
-2. **Write `README.md`** at the project root — the front page for humans and git repositories. Include project name, description, tech stack, how to build/run/test, and links to docs. For monorepos, also write a README for each sub-project.
-3. **Write `docs/architecture.md`** — a high-level overview of how the system fits together, with visual descriptions of data flow and feature interactions. Avoid ASCII directory trees — focus on concepts and relationships.
-4. **Write `docs/{feature}.md`** for each major feature — descriptive documents explaining how features work, their mechanisms, patterns, and technologies. Use diagrams, tables, and visual descriptions. Include code examples only when they genuinely clarify something prose cannot. These should be higher level than `.claude_docs/` feature docs but still substantive enough for a developer to understand the feature without reading source code.
-5. **Write `docs/openapi.yaml`** — if the project has REST API endpoints, generate an OpenAPI 3.0+ spec covering all routes, request/response schemas, authentication, and error responses
-6. **Write `docs/api.md`** — human-readable API reference if the project has APIs
-7. **Write `docs/development.md`** — build, run, and test instructions with actual commands (if applicable)
-8. **Write `docs/glossary.md`** if the project has domain-specific terminology
+1. **Write `{prefix}/_project.md`** using `mcp__obsidian__write_note` — aggregate all features, components, and file mappings into the project config note using the template from the Bootstrap section. Tag it with `doctrack/type/index`, `doctrack/status/active`, `doctrack/audience/claude`.
+
+2. **Write `README.md`** at the project root **on the filesystem** using the standard `Write` tool — the front page for humans and git hosting. Include project name, description, tech stack, how to build/run/test, and a note that detailed documentation is in the Obsidian vault. For monorepos, also write a README for each sub-project.
+
+3. **Write `CLAUDE.md`** at the project root **on the filesystem** — this wires up future Claude Code sessions to use doctrack. Read the existing `CLAUDE.md` first (if any). If it already contains a `# Doctrack` section, update that section in place. If not, append the section to the end (or create the file if it doesn't exist). Use this template:
+
+   ```markdown
+   # Doctrack
+
+   This project's documentation is maintained in an Obsidian vault using the doctrack skill.
+   Project: `{project-name}` | Vault path: `{prefix}/`
+
+   ## Before starting work
+   - Search Obsidian for this project's docs: the project config note is at `{prefix}/_project.md`
+   - Read relevant feature and component notes to understand the area you'll be working in
+   - Check `{prefix}/references/` for any supplementary documentation
+   - Use the doctrack skill to load and review documentation before planning any implementation
+
+   ## After making code changes
+   - Use the doctrack skill to update documentation for any code you modified
+   - Update the relevant feature/component notes in Obsidian
+   - Update the project config note (`{prefix}/_project.md`) if you added new features or files
+   - Update human-readable guides in `{prefix}/guides/` if the changes affect developer-facing documentation
+   - Always update `last_updated` frontmatter timestamps on modified notes
+   ```
+
+   Use the standard `Read` tool to check for an existing file, then `Edit` to update or `Write` to create.
+
+4. **Write `{prefix}/guides/architecture.md`** to Obsidian — a high-level overview of how the system fits together, with visual diagrams of data flow and feature interactions. Avoid ASCII directory trees. Tag: `doctrack/type/guide`, `doctrack/audience/human`.
+
+5. **Write `{prefix}/guides/{feature}.md`** for each major feature — descriptive guides for developers. Higher level than feature notes but substantive. Use diagrams, tables, wikilinks to feature notes. Tag: `doctrack/type/guide`, `doctrack/audience/human`.
+
+6. **Write `{prefix}/specs/openapi.md`** to Obsidian — if the project has REST API endpoints, generate an OpenAPI 3.0+ spec wrapped in a YAML code block. Tag: `doctrack/type/spec`, `doctrack/audience/machine`.
+
+7. **Write `{prefix}/guides/api.md`** — human-readable API reference if the project has APIs.
+
+8. **Write `{prefix}/guides/development.md`** — build, run, and test instructions with actual commands (if applicable).
+
+9. **Write `{prefix}/guides/glossary.md`** if the project has domain-specific terminology.
+
+For shared vaults, update `_doctrack.md` at vault root with the new project entry.
 
 #### Phase 3.5: Verify cross-references
 
-After all feature docs exist, do a cross-reference pass:
+After all feature notes exist, do a cross-reference pass:
 
-1. **Check every feature's Dependencies section** — does it list all the other features it imports from? Read the source files' import statements to verify.
-2. **Check component Relationships sections** — are "Used by" and "Depends on" populated? A component that imports from another feature's files should list that dependency.
-3. **Fill in gaps** — if a feature imports from another feature but doesn't mention it in Dependencies, add it. This is the most common gap in init documentation and it matters because future sessions use these cross-references to understand change impact.
+1. **Batch-read feature notes**: Use `mcp__obsidian__read_multiple_notes` (up to 10 at a time) to load all feature docs. If you already have their content in memory from Phase 2, skip this — don't re-read notes you just wrote.
+
+2. **Check every feature's Dependencies section** — does it list all the other features it imports from? Read the source files' import statements to verify. Ensure wikilinks are correct.
+
+3. **Check component Relationships sections** — are "Used by" and "Depends on" populated with wikilinks? A component that imports from another feature's files should list that dependency.
+
+4. **Fill in gaps** — use `mcp__obsidian__patch_note` to add missing cross-references. This is the most common gap in init documentation and it matters because future sessions use these cross-references to understand change impact.
 
 #### Phase 4: Verify completeness
 
-Check that every source file in the project appears in the File Registry. Files that don't belong to any feature likely indicate:
-- A feature you missed (create docs for it)
-- Utility/shared code (document as a "shared" or "common" feature)
-- Dead code (note it in the index)
+Check that every source file in the project appears in the File Registry:
+
+1. `mcp__obsidian__list_directory("{prefix}/features")` to get all feature notes.
+2. Use `mcp__obsidian__get_frontmatter` on each feature note to extract `files` lists — this is cheaper than reading full note content. Only use `read_multiple_notes` if you need the full content for other reasons.
+3. Compare against the source files discovered in Phase 1.
+4. Files not belonging to any feature likely indicate:
+   - A feature you missed (create notes for it)
+   - Utility/shared code (document as a "shared" or "common" feature)
+   - Dead code (note it in `_project.md`)
 
 ### Init for monorepos
 
-For monorepos with multiple packages/apps, use **separate `.claude_docs/` directories per package** with a lightweight root-level coordination file. This matches how monorepo work actually happens — scoped to a package — while still capturing cross-package relationships.
+For monorepos with multiple packages/apps, use **separate folders per package within Obsidian** with a lightweight root-level coordination note.
 
 **Detecting monorepos:** Look for `workspaces` in `package.json`, `pnpm-workspace.yaml`, `lerna.json`, Turborepo config (`turbo.json`), Nx config (`nx.json`), or multiple `go.mod` files. Also check for a `packages/`, `apps/`, or `services/` directory containing multiple sub-projects with their own config files.
 
-#### Monorepo directory structure
+#### Monorepo vault structure
 
 ```
-monorepo/
-├── .claude_docs/
-│   └── index.md                       # Root coordination: package map, cross-package deps, shared conventions
+{prefix}/
+├── _project.md                     # Root: package map, cross-package deps, shared conventions
 ├── packages/
 │   ├── api/
-│   │   ├── .claude_docs/              # Full doctrack structure for api
-│   │   │   ├── index.md
-│   │   │   ├── references/
-│   │   │   ├── {feature}/
-│   │   │   │   ├── feature.md
-│   │   │   │   └── components/
-│   │   │   └── ...
-│   │   ├── docs/                      # Human-readable docs for api
-│   │   └── src/
+│   │   ├── _package.md             # Package config: feature list, file registry
+│   │   ├── features/
+│   │   │   └── {feature-name}.md
+│   │   ├── components/
+│   │   │   └── {feature}/{component}.md
+│   │   ├── guides/
+│   │   └── specs/
 │   ├── web/
-│   │   ├── .claude_docs/              # Full doctrack structure for web
-│   │   │   ├── index.md
-│   │   │   └── ...
-│   │   ├── docs/
-│   │   └── src/
+│   │   ├── _package.md
+│   │   └── ...
 │   └── shared/
-│       ├── .claude_docs/              # Full doctrack structure for shared
-│       │   ├── index.md
-│       │   └── ...
-│       ├── docs/
-│       └── src/
-├── docs/                              # Root-level human docs (architecture overview, getting started)
-└── ...
+│       ├── _package.md
+│       └── ...
+├── guides/                          # Root-level guides
+│   └── architecture.md
+└── references/
 ```
 
-#### Root `.claude_docs/index.md` for monorepos
+#### Root `_project.md` for monorepos
 
-The root index is a coordination file, not a full documentation index. It should contain:
+The root config is a coordination note. Use `mcp__obsidian__write_note` with this template:
 
 ```markdown
-# Monorepo Documentation Index
+---
+project: {project-name}
+type: index
+cwd: {filesystem-path-to-project}
+vault_layout: single|shared
+monorepo: true
+initialized: YYYY-MM-DD
+last_updated: YYYY-MM-DD
+---
+
+# {Project Name} — Monorepo
 
 > Auto-maintained by doctrack. Last updated: YYYY-MM-DD
 
@@ -443,87 +744,136 @@ The root index is a coordination file, not a full documentation index. It should
 - [List monorepo-wide patterns, build conventions, shared tooling, etc.]
 ```
 
-#### Per-package `.claude_docs/`
+#### Per-package `_package.md`
 
-Each package gets the full doctrack structure — its own `index.md`, features, components, file registry, and `references/` directory. Document each package as if it were a standalone project, but note cross-package dependencies explicitly in feature docs.
+Each package gets the full doctrack structure. Use `mcp__obsidian__write_note` to create `{prefix}/packages/{name}/_package.md` with the same template as `_project.md` but scoped to that package. Tag all notes within a package with `doctrack/package/{package-name}`.
 
-In each package's feature docs, reference other packages by name:
+In each package's feature notes, reference other packages using wikilinks:
 ```markdown
 ## Dependencies
-- **Internal**: auth-middleware, database layer
-- **Cross-package**: `@repo/shared` (types, validation schemas)
+- **Internal**: [[packages/api/features/auth|Auth middleware]], [[packages/api/features/database|Database layer]]
+- **Cross-package**: [[packages/shared/_package|@repo/shared]] (types, validation schemas)
 - **External**: express, cors
 ```
 
 #### Monorepo init workflow
 
 1. **Detect monorepo structure** — identify packages/apps and their boundaries
-2. **Create root `.claude_docs/index.md`** — map all packages, their relationships, and shared conventions
-3. **Init each package independently** — run the standard Phase 1-4 init workflow within each package, creating `packages/{name}/.claude_docs/` and `packages/{name}/docs/`
-4. **Write root `docs/architecture.md`** — high-level overview of the entire monorepo, how packages fit together, deployment topology
-5. **Cross-reference pass** — ensure each package's docs correctly reference their cross-package dependencies
+2. **Write root `{prefix}/_project.md`** — map all packages, their relationships, and shared conventions
+3. **Init each package independently** — run the standard Phase 1-4 init within each package's folder (`{prefix}/packages/{name}/`)
+4. **Write root `{prefix}/guides/architecture.md`** — high-level overview of the entire monorepo
+5. **Write `README.md`** at the monorepo root and per-package on the filesystem
+6. **Write `CLAUDE.md`** at the monorepo root on the filesystem using the same idempotent strategy as the standard init (read existing, update or append the `# Doctrack` section). For monorepos, the root `CLAUDE.md` should reference the root `_project.md` and list all packages. Optionally write per-package `CLAUDE.md` files scoped to that package's vault prefix (`{prefix}/packages/{name}/`).
+7. **Cross-reference pass** — ensure each package's notes correctly reference their cross-package dependencies with wikilinks
+8. **Tag everything** — add `doctrack/package/{name}` tags to all notes within each package
 
-Use subagents to init multiple packages in parallel — each package is independent and won't conflict.
+Use subagents to init multiple packages in parallel — each package is independent.
 
 #### Finding docs in a monorepo
 
 When starting work in a monorepo, determine your scope:
 
-- **Working on a specific package**: Read that package's `.claude_docs/index.md` first, then the root `.claude_docs/index.md` for cross-package context
-- **Working across packages**: Read the root `.claude_docs/index.md` first, then the relevant package indexes
-- **Navigating from a file**: Find the nearest `.claude_docs/` by walking up from the file's directory — this gives you the right package context
+- **Working on a specific package**: Read that package's `_package.md` first via `mcp__obsidian__read_note("{prefix}/packages/{name}/_package.md")`, then the root `_project.md` for cross-package context.
+- **Working across packages**: Read the root `_project.md` first, then the relevant package configs.
+- **Searching by package**: Use `mcp__obsidian__search_notes` — notes are tagged with `doctrack/package/{name}` for easy filtering.
 
 ---
 
-## Working with teams (multi-agent / worktrees)
+## Working with teams (multi-agent / concurrent access)
 
-When other agents or team skills use doctrack — especially in git worktree setups where multiple agents work on different branches simultaneously — there are coordination challenges. This section helps teams use doctrack effectively.
+When other agents or team skills use doctrack, all agents share the same Obsidian vault. Unlike filesystem-based docs in git worktrees, there is **one copy of each note** — no merge conflicts, but concurrent write risk.
 
-### For team orchestrators (the skill that manages teams)
+### For team orchestrators
 
-If you're building a skill that spawns team members in worktrees, include these instructions when assigning tasks:
+If you're building a skill that spawns team members, include these instructions when assigning tasks:
 
 ```
 Documentation requirements:
-- Read .claude_docs/index.md before starting work to understand the codebase
-- After completing your code changes, update .claude_docs/ for any features/components you modified
+- Search Obsidian for existing docs before starting work: search_notes("{feature-name}")
+- After completing code changes, update the relevant feature/component notes in Obsidian
 - Only update docs for code YOU changed — don't touch docs for other features
-- Use the doctrack templates (feature.md, components/*.md) with standard frontmatter
+- When adding entries to _project.md, use write_note with mode: "append" to avoid overwriting
+- Set frontmatter editing_agent while editing a doc, clear it when done
+- Use the doctrack templates and always tag notes after creating them
 ```
 
-### How doctrack works across worktrees
+### How concurrent access works
 
-Each worktree gets its own copy of `.claude_docs/`. When branches merge back:
+Obsidian is a shared data store — all agents see the same notes in real-time:
 
-1. **Doc updates for different features** merge cleanly (different files, no conflicts)
-2. **Index.md will conflict** if multiple agents added entries — this is expected and easy to resolve (just combine the table rows)
-3. **Same-feature doc updates** will conflict if two agents modified the same feature — the merge resolver should keep the more recent/comprehensive version
+1. **No merge conflicts** — there is only one copy of each note
+2. **Real-time visibility** — when one agent updates a note, others see it immediately
+3. **Concurrent write risk** — two agents could overwrite each other's changes to the same note
 
-### Minimizing merge conflicts
+### Minimizing conflicts
 
-Doctrack is designed to be merge-friendly:
+**Scope-based partitioning**: Each agent should only update notes for the features/components it is actively modifying. This directly prevents write conflicts.
 
-- **One file per component** means agents working on different components never conflict
-- **Feature-level docs** only conflict if two agents modify the same feature (uncommon in well-scoped tasks)
-- **The index** is the most likely conflict point. To minimize this:
-  - Each agent should only ADD rows, never rewrite the whole table
-  - Use append-style edits rather than rewriting index.md from scratch
+**Append-only for the project config**: When multiple agents work simultaneously, they should use `mcp__obsidian__write_note` with `mode: "append"` to add new rows to `_project.md`, rather than rewriting it.
+
+**Advisory locking**: Before updating a feature note, check `mcp__obsidian__get_frontmatter` for an `editing_agent` field. If set and recent, skip that note and leave a note for the reconciliation step. When you start editing:
+```
+mcp__obsidian__update_frontmatter(path, {editing_agent: "{agent-id}", editing_since: "YYYY-MM-DDTHH:MM:SS"}, merge=true)
+```
+Clear it when done:
+```
+mcp__obsidian__update_frontmatter(path, {editing_agent: null, editing_since: null}, merge=true)
+```
 
 ### What team members should do
 
-When an agent starts work in a worktree:
+When an agent starts work:
 
-1. **Read `.claude_docs/index.md`** — understand what's documented and what your task touches
-2. **Read relevant feature/component docs** — get up to speed on the area you'll be working in
+1. **Search for relevant docs** — `mcp__obsidian__search_notes` to understand what's documented
+2. **Read relevant feature/component notes** — get up to speed on the area you'll work in
 3. **Do your code work**
-4. **Update docs for what you changed** — create or edit feature/component docs as needed
-5. **Append new entries to index.md** — don't rewrite it, just add your new rows at the bottom of each table
+4. **Update notes for what you changed** — create or edit feature/component notes as needed
+5. **Append new entries to `_project.md`** — don't rewrite it, use append mode
 
-### Post-merge reconciliation
+### Post-task reconciliation
 
-After merging worktree branches back, the orchestrator (or a dedicated reconciliation step) should:
+After all agents complete their work, the orchestrator should:
 
-1. **Resolve any index.md conflicts** — combine all table entries, deduplicate
-2. **Check for stale docs** — if a merge deleted code, mark related docs as deprecated
-3. **Update timestamps** — set `last_updated` to the merge date for any docs that were conflict-resolved
-4. **Verify the File Registry** — ensure all source files are still mapped correctly after the merge
+1. **Read `_project.md`** — consolidate any append-mode additions, deduplicate table rows
+2. **Check for stale notes** — if code was deleted, mark related notes as deprecated
+3. **Update timestamps** — `mcp__obsidian__update_frontmatter` with current date
+4. **Clear advisory locks** — remove any remaining `editing_agent` fields
+5. **Verify the File Registry** — ensure all source files are still mapped correctly
+
+---
+
+## Obsidian tool reference
+
+Quick reference for which MCP tool to use in each situation. Tools are listed from **lightest to heaviest** — always prefer the lightest tool that gets the job done.
+
+| Tool | When to Use | Token Cost |
+|------|-------------|------------|
+| `mcp__obsidian__get_frontmatter` | Checking metadata (timestamps, status, files) without loading full content. **Use this to triage before full reads.** | Minimal |
+| `mcp__obsidian__get_notes_info` | Checking existence and timestamps for multiple notes in one call. **Use for bulk existence checks.** | Minimal |
+| `mcp__obsidian__get_vault_stats` | Orientation at session start — vault size and recently modified notes. | Minimal |
+| `mcp__obsidian__manage_tags` | Adding/removing tags. Use `operation: "add"` after creating notes, `"remove"`/`"add"` pair for status changes. | Low |
+| `mcp__obsidian__update_frontmatter` | Updating metadata only (timestamps, status, file lists). Use `merge=true` to preserve existing fields. **Prefer over `patch_note` for metadata changes.** | Low |
+| `mcp__obsidian__search_notes` | Finding docs by feature name, file path, or content. Use `searchFrontmatter=true` for metadata queries. **Prefer over `list_directory` + `read_multiple_notes`.** | Low–Medium |
+| `mcp__obsidian__list_directory` | Browsing vault structure, listing features/components/guides. Use when you need a complete inventory, not when searching. | Low |
+| `mcp__obsidian__patch_note` | Surgical edits — replacing specific strings in existing notes. Fails on ambiguous matches unless `replaceAll=true`. **Prefer over `write_note` for updates.** | Medium |
+| `mcp__obsidian__move_note` | Renaming or reorganizing notes (e.g., renaming a feature). | Medium |
+| `mcp__obsidian__read_note` | Reading a single known note by path. **Use `get_frontmatter` first if you might not need the full content.** | Medium–High |
+| `mcp__obsidian__read_multiple_notes` | Batch loading — up to 10 notes per call. **Always prefer this over sequential `read_note` calls.** | High (but much cheaper than N individual reads) |
+| `mcp__obsidian__write_note` | Creating new notes or full rewrites. Use `mode: "append"` when adding to `_project.md` concurrently. **For updates, prefer `patch_note` or `update_frontmatter` instead.** | High |
+| `mcp__obsidian__delete_note` | Only for truly erroneous notes created by mistake. Prefer deprecation over deletion. | Low |
+
+---
+
+## Vault setup
+
+To use doctrack, you need:
+
+1. **An Obsidian vault** — can be an existing vault or a new one dedicated to project documentation.
+2. **The Obsidian MCP plugin** — configured and running so that Claude Code can access the vault via `mcp__obsidian__*` tools.
+3. **Run `doctrack init`** — this handles all folder creation within the vault. No manual setup required.
+
+The vault can be:
+- **Dedicated** to a single project (simpler, all notes at vault root)
+- **Shared** across multiple projects (notes under `projects/{name}/`)
+
+You'll be asked which layout to use during `doctrack init`. This choice is stored in `_project.md` frontmatter and persists across sessions.
