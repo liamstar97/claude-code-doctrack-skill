@@ -1,3 +1,10 @@
+> [!WARNING]
+> **Standalone doctrack is frozen — EOL as of 2026-05-18.** It is superseded by
+> **Switchyard**, where doctrack continues as a bundled first-party plugin.
+> This repository remains available and installable but receives no new
+> features. An existing `.doctrack/` vault migrates losslessly into
+> `.switchyard/plugins/doctrack/`.
+
 # Doctrack
 
 A codebase knowledge graph for Claude. Doctrack builds and maintains a structured Obsidian vault (`.doctrack/`) that serves as persistent memory across sessions — read before working, write after changing.
