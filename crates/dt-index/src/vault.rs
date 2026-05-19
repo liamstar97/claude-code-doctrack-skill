@@ -345,8 +345,9 @@ fn extract_summary(body: &str) -> String {
     }
 
     let summary = lines.join(" ");
-    if summary.len() > 300 {
-        format!("{}...", &summary[..297])
+    if summary.chars().count() > 300 {
+        let truncated: String = summary.chars().take(297).collect();
+        format!("{truncated}...")
     } else {
         summary
     }
@@ -392,6 +393,28 @@ mod tests {
         let body = "Uses [[$varName]] and [[Real Note]].";
         let links = extract_wikilinks(body);
         assert_eq!(links, vec!["Real Note"]);
+    }
+
+    #[test]
+    fn test_extract_summary_truncates_on_char_boundary() {
+        // Regression: doctrack notes are full of em-dashes (3 bytes each).
+        // The old code did `&summary[..297]`, which panicked when byte 297
+        // landed inside a multibyte char. Build a body where an em-dash
+        // straddles the old byte boundary and a long em-dash-heavy paragraph.
+        let body = format!("{}\u{2014}{}", "a".repeat(296), "b".repeat(400));
+        let summary = extract_summary(&body);
+        assert!(summary.ends_with("..."));
+        assert!(summary.chars().count() <= 300);
+
+        let dashes = "\u{2014} ".repeat(400);
+        let summary = extract_summary(&dashes);
+        assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_summary_short_unchanged() {
+        let summary = extract_summary("A short note \u{2014} with an em-dash.");
+        assert_eq!(summary, "A short note \u{2014} with an em-dash.");
     }
 
     #[test]

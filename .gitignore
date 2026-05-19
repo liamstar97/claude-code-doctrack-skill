@@ -4,6 +4,9 @@ target/
 # Test workspace (large, contains iteration artifacts)
 doctrack-workspace/
 
+# Benchmark run outputs (local, not committed)
+benchmarks/
+
 # OS files
 .DS_Store
 

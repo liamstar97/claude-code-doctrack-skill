@@ -30,6 +30,10 @@ async fn main() -> Result<()> {
                 print_version();
                 return Ok(());
             }
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
             "--update" => return run_update(),
             _ => {}
         }
@@ -225,6 +229,35 @@ fn print_version() {
         "doctrack-mcp {} ({})",
         env!("CARGO_PKG_VERSION"),
         env!("GIT_HASH")
+    );
+}
+
+fn print_help() {
+    println!(
+        "doctrack-mcp {} ({})
+
+{}
+
+USAGE:
+    doctrack-mcp [OPTION]
+
+With no arguments, starts the MCP server on stdio — this is how Claude Code
+launches it. Each OPTION below runs a single one-shot command and exits.
+
+OPTIONS:
+    --check-impact <FILE>     Report vault notes affected by changes to FILE
+    --validate-note <NOTE>    Check a vault note for stale refs / broken wikilinks
+    --coverage                Print a one-line vault coverage summary
+    --setup-hooks             Install Claude Code hooks into .claude/settings.json
+    --update                  Reinstall doctrack binaries from GitHub main
+    -V, --version             Print version and git hash
+    -h, --help                Print this help
+
+ENVIRONMENT:
+    DOCTRACK_ROOT             Project root (defaults to the current directory)",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_HASH"),
+        env!("CARGO_PKG_DESCRIPTION"),
     );
 }
 
