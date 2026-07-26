@@ -4,8 +4,9 @@ target/
 # Test workspace (large, contains iteration artifacts)
 doctrack-workspace/
 
-# Benchmark run outputs (local, not committed)
-benchmarks/
+# Benchmark runs ARE committed — see CONTRIBUTING.md. Scratch output goes to
+# benchmarks/local/ so it can be kept out of the way without hiding real runs.
+benchmarks/local/
 
 # OS files
 .DS_Store

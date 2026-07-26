@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The binaries are what users install via `cargo install --git`; make sure
+      # a release build of both actually succeeds.
+      - name: Build release binaries
+        run: cargo build --workspace --release --bins
+
+  vault-evaluator:
+    name: evaluate_vault.py
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Syntax check
+        run: python -m py_compile scripts/evaluate_vault.py
+
+      - name: Smoke test against a minimal vault
+        run: |
+          mkdir -p /tmp/demo/.doctrack/features
+          cat > /tmp/demo/.doctrack/_project.md <<'EOF'
+          ---
+          project: demo
+          type: index
+          ---
+          # Demo
+          EOF
+          cat > /tmp/demo/.doctrack/features/auth.md <<'EOF'
+          ---
+          type: feature
+          status: active
+          ---
+          # Auth
+          Links to [[_project]].
+          EOF
+          python scripts/evaluate_vault.py /tmp/demo --print

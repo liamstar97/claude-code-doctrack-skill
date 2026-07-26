@@ -10,6 +10,8 @@ use walkdir::WalkDir;
 pub enum FileRefSource {
     /// From frontmatter file-registry — high trust, explicit path
     Frontmatter,
+    /// From a markdown file-registry table (the `_project.md` convention) — high trust
+    RegistryTable,
     /// From backtick content in note body — needs validation
     InlineCode,
 }
@@ -33,6 +35,9 @@ pub struct VaultNote {
     pub frontmatter: Frontmatter,
     pub file_refs: Vec<FileRef>,
     pub wikilinks: Vec<String>,
+    /// Code identifiers found in inline backticks, deduplicated. Precomputed at
+    /// parse time so linking is a map lookup rather than a scan of the note body.
+    pub code_idents: Vec<String>,
     pub summary: String,
     pub body: String,
 }
@@ -54,12 +59,25 @@ pub struct Frontmatter {
     pub status: Option<String>,
 }
 
+/// Vault subdirectories that hold Obsidian's own state rather than notes.
+const VAULT_SKIP_DIRS: &[&str] = &[".obsidian", ".trash", ".git", ".smart-env"];
+
+/// True if this path lives inside a directory the vault walk should ignore.
+pub fn is_vault_internal(path: &Path) -> bool {
+    path.components()
+        .any(|c| VAULT_SKIP_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
+}
+
 /// Parse all markdown notes in a vault directory.
 pub fn parse_vault(vault_root: &Path) -> Result<Vec<VaultNote>> {
     let mut notes = Vec::new();
 
     for entry in WalkDir::new(vault_root)
         .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !(e.file_type().is_dir() && VAULT_SKIP_DIRS.contains(&name.as_ref()))
+        })
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
@@ -90,7 +108,7 @@ pub fn parse_note(path: &Path) -> Result<VaultNote> {
     let title = fm
         .title
         .clone()
-        .or_else(|| extract_h1(&body))
+        .or_else(|| extract_h1(body))
         .unwrap_or_else(|| {
             path.file_stem()
                 .unwrap_or_default()
@@ -99,9 +117,16 @@ pub fn parse_note(path: &Path) -> Result<VaultNote> {
         });
 
     let note_type = fm.note_type.clone().unwrap_or_default();
-    let file_refs = extract_file_refs(&fm, &body);
-    let wikilinks = extract_wikilinks(&body);
-    let summary = extract_summary(&body);
+
+    // Fenced code blocks are examples and diagrams, not references. Strip them
+    // once and derive every backtick-based signal from what's left, so a Mermaid
+    // node label or a code sample can't manufacture links.
+    let prose = strip_fenced_blocks(body);
+
+    let file_refs = extract_file_refs(&fm, &prose);
+    let wikilinks = extract_wikilinks(body);
+    let code_idents = extract_code_idents(&prose);
+    let summary = extract_summary(body);
 
     Ok(VaultNote {
         path: path.to_path_buf(),
@@ -110,6 +135,7 @@ pub fn parse_note(path: &Path) -> Result<VaultNote> {
         frontmatter: fm,
         file_refs,
         wikilinks,
+        code_idents,
         summary,
         body: body.to_string(),
     })
@@ -141,37 +167,108 @@ fn extract_h1(body: &str) -> Option<String> {
     None
 }
 
-/// Extract file references from frontmatter file-registry and inline code paths.
-fn extract_file_refs(fm: &Frontmatter, body: &str) -> Vec<FileRef> {
-    let mut refs = Vec::new();
+/// Extract file references from frontmatter, markdown registry tables, and
+/// inline code paths. Deduplicated on (path, line), keeping the highest-trust
+/// source — a file listed in frontmatter *and* mentioned in prose is one
+/// reference, not two.
+fn extract_file_refs(fm: &Frontmatter, prose: &str) -> Vec<FileRef> {
+    let mut refs: Vec<FileRef> = Vec::new();
+
+    let push = |raw: &str, source: FileRefSource, refs: &mut Vec<FileRef>| {
+        let Some((path, line)) = parse_file_ref(raw) else {
+            return;
+        };
+        if refs.iter().any(|r| r.path == path && r.line == line) {
+            return;
+        }
+        let is_bare = !path.to_string_lossy().contains('/');
+        refs.push(FileRef {
+            path,
+            line,
+            source,
+            is_bare_filename: is_bare,
+        });
+    };
 
     // From frontmatter file-registry and files — trusted, always include
     for entry in fm.file_registry.iter().chain(fm.files.iter()) {
-        if let Some((path, line)) = parse_file_ref(entry) {
-            let is_bare = !path.to_string_lossy().contains('/');
-            refs.push(FileRef {
-                path,
-                line,
-                source: FileRefSource::Frontmatter,
-                is_bare_filename: is_bare,
-            });
-        }
+        push(entry, FileRefSource::Frontmatter, &mut refs);
+    }
+
+    // From markdown registry tables — `_project.md` keeps its file registry as a
+    // table rather than frontmatter, so without this the registry is invisible.
+    for entry in find_table_paths(prose) {
+        push(&entry, FileRefSource::RegistryTable, &mut refs);
     }
 
     // From inline backtick code — filtered more carefully
-    for cap in find_backtick_paths(body) {
-        if let Some((path, line)) = parse_file_ref(&cap) {
-            let is_bare = !path.to_string_lossy().contains('/');
-            refs.push(FileRef {
-                path,
-                line,
-                source: FileRefSource::InlineCode,
-                is_bare_filename: is_bare,
-            });
-        }
+    for cap in find_backtick_paths(prose) {
+        push(&cap, FileRefSource::InlineCode, &mut refs);
     }
 
     refs
+}
+
+/// Collect first-column cells of markdown tables that look like file paths.
+///
+/// This is how the `_project.md` File Registry is expressed:
+///
+/// ```text
+/// | Source File                  | Feature | Component  |
+/// |------------------------------|---------|------------|
+/// | src/auth/SessionManager.java | auth    | session    |
+/// ```
+fn find_table_paths(body: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            continue;
+        }
+        // Skip the header separator row (|---|---|)
+        if trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) {
+            continue;
+        }
+        let Some(first_cell) = trimmed
+            .trim_start_matches('|')
+            .split('|')
+            .next()
+            .map(|c| c.trim().trim_matches('`').trim())
+        else {
+            continue;
+        };
+        if looks_like_path(first_cell) {
+            paths.push(first_cell.to_string());
+        }
+    }
+
+    paths
+}
+
+/// Extract deduplicated code identifiers from inline backtick spans.
+fn extract_code_idents(prose: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut idents = Vec::new();
+
+    for content in backtick_spans(prose) {
+        if looks_like_identifier(&content) && seen.insert(content.clone()) {
+            idents.push(content);
+        }
+    }
+
+    idents
+}
+
+/// Heuristic: does this look like a code identifier rather than a file path or prose?
+pub fn looks_like_identifier(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.contains(' ') || s.contains('/') {
+        return false;
+    }
+    // Must start with a letter or underscore
+    s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Parse a file reference like "src/auth.rs:42" into (path, optional line).
@@ -182,44 +279,50 @@ fn parse_file_ref(s: &str) -> Option<(PathBuf, Option<u32>)> {
     }
 
     // Check for path:line format
-    if let Some((path_str, line_str)) = s.rsplit_once(':') {
-        if let Ok(line) = line_str.parse::<u32>() {
-            return Some((PathBuf::from(path_str), Some(line)));
-        }
+    if let Some((path_str, line_str)) = s.rsplit_once(':')
+        && let Ok(line) = line_str.parse::<u32>()
+    {
+        return Some((PathBuf::from(path_str), Some(line)));
     }
 
     Some((PathBuf::from(s), None))
 }
 
-/// Find backtick-enclosed strings that look like file paths.
-fn find_backtick_paths(body: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut chars = body.chars().peekable();
-    let mut in_backtick = false;
-    let mut current = String::new();
+/// Collect the contents of every inline backtick span in the text.
+///
+/// Spans are matched within a single line: an unclosed backtick shouldn't
+/// swallow the rest of the document.
+fn backtick_spans(body: &str) -> Vec<String> {
+    let mut spans = Vec::new();
 
-    while let Some(ch) = chars.next() {
-        if ch == '`' && !in_backtick {
-            in_backtick = true;
-            current.clear();
-        } else if ch == '`' && in_backtick {
-            in_backtick = false;
-            if looks_like_path(&current) {
-                paths.push(current.clone());
+    for line in body.lines() {
+        let mut rest = line;
+        while let Some(start) = rest.find('`') {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find('`') else { break };
+            let content = rest[..end].trim();
+            if !content.is_empty() {
+                spans.push(content.to_string());
             }
-        } else if in_backtick {
-            current.push(ch);
+            rest = &rest[end + 1..];
         }
     }
 
-    paths
+    spans
+}
+
+/// Find backtick-enclosed strings that look like file paths.
+fn find_backtick_paths(body: &str) -> Vec<String> {
+    backtick_spans(body)
+        .into_iter()
+        .filter(|s| looks_like_path(s))
+        .collect()
 }
 
 /// Known code file extensions.
 const CODE_EXTENSIONS: &[&str] = &[
-    ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go",
-    ".java", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
-    ".kt", ".swift", ".rb", ".cs", ".scala",
+    ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".c", ".cpp", ".cc", ".cxx", ".h",
+    ".hpp", ".kt", ".swift", ".rb", ".cs", ".scala",
 ];
 
 /// Heuristic: does this backtick content look like a file path?
@@ -295,13 +398,82 @@ fn extract_wikilinks(body: &str) -> Vec<String> {
     links
 }
 
+/// Blank out fenced code blocks, preserving line structure.
+///
+/// Inline backticks are left intact — they carry the file paths and symbol
+/// names we want. Only fenced blocks (code samples, Mermaid diagrams) are
+/// dropped, because their contents are illustrative rather than referential.
+pub fn strip_fenced_blocks(body: &str) -> String {
+    let mut result = String::with_capacity(body.len());
+    let mut in_fenced_block = false;
+
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fenced_block = !in_fenced_block;
+            result.push('\n');
+            continue;
+        }
+        if !in_fenced_block {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+
+    result
+}
+
+/// True if a note's file reference denotes `path`.
+///
+/// A reference matches when its path components are a suffix of the target's:
+/// `auth/session.rs` matches `src/auth/session.rs`, and `session.rs` matches it
+/// too. Plain string `ends_with` would additionally match `src/auth/mysession.rs`,
+/// which is how unrelated notes ended up attached to a file.
+pub fn ref_matches_path(reference: &Path, path: &Path) -> bool {
+    let target: Vec<_> = path.components().collect();
+    let refc: Vec<_> = reference.components().collect();
+
+    if refc.is_empty() || refc.len() > target.len() {
+        return false;
+    }
+    target[target.len() - refc.len()..] == refc[..]
+}
+
+/// True if `haystack` mentions `ident` as a standalone identifier.
+///
+/// A plain substring test reports `new` as "documented" by any note containing
+/// the word "renewal", and `Index` by any note containing "index" — so symbol
+/// drift detection needs identifier boundaries, not `contains`.
+pub fn mentions_identifier(haystack: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    let hay = haystack.to_ascii_lowercase();
+    let needle = ident.to_ascii_lowercase();
+    let bytes = hay.as_bytes();
+
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut from = 0;
+    while let Some(offset) = hay[from..].find(&needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_word(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_word(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+
+    false
+}
+
 /// Replace fenced code blocks and inline backtick spans with empty strings.
 fn strip_code_spans(body: &str) -> String {
     let mut result = String::with_capacity(body.len());
-    let mut lines = body.lines().peekable();
     let mut in_fenced_block = false;
 
-    while let Some(line) = lines.next() {
+    for line in body.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") {
             in_fenced_block = !in_fenced_block;
@@ -313,9 +485,8 @@ fn strip_code_spans(body: &str) -> String {
             continue;
         }
         // Strip inline backtick spans
-        let mut chars = line.chars().peekable();
         let mut in_backtick = false;
-        while let Some(ch) = chars.next() {
+        for ch in line.chars() {
             if ch == '`' {
                 in_backtick = !in_backtick;
             } else if !in_backtick {
@@ -429,6 +600,129 @@ mod tests {
         let (path, line) = parse_file_ref("src/auth.rs").unwrap();
         assert_eq!(path, PathBuf::from("src/auth.rs"));
         assert_eq!(line, None);
+    }
+
+    #[test]
+    fn test_looks_like_identifier() {
+        assert!(looks_like_identifier("SessionManager"));
+        assert!(looks_like_identifier("parse_note"));
+        assert!(looks_like_identifier("_private"));
+        assert!(!looks_like_identifier("src/main.rs"));
+        assert!(!looks_like_identifier("some text"));
+        assert!(!looks_like_identifier(""));
+    }
+
+    #[test]
+    fn test_extract_code_idents() {
+        let body = "Uses `SessionManager` to handle `parse_note` from `src/vault.rs`";
+        assert_eq!(
+            extract_code_idents(body),
+            vec!["SessionManager", "parse_note"]
+        );
+    }
+
+    #[test]
+    fn test_extract_code_idents_deduplicates() {
+        let body = "`Foo` calls `Foo` again, then `Bar`.";
+        assert_eq!(extract_code_idents(body), vec!["Foo", "Bar"]);
+    }
+
+    #[test]
+    fn test_fenced_blocks_do_not_produce_refs() {
+        // Regression: Mermaid node labels and code samples were being mined for
+        // symbol names and file paths, manufacturing links a note never made.
+        let body = "\
+Real prose mentions `SessionManager` and `src/real.rs`.
+
+```mermaid
+graph TD
+    A[NotASymbol] --> B
+```
+
+```rust
+fn bogus_symbol() {}
+// see src/bogus.rs
+```
+";
+        let prose = strip_fenced_blocks(body);
+        assert_eq!(extract_code_idents(&prose), vec!["SessionManager"]);
+        assert_eq!(find_backtick_paths(&prose), vec!["src/real.rs"]);
+    }
+
+    #[test]
+    fn test_unterminated_backtick_does_not_swallow_document() {
+        let body = "An `unclosed span\nand a real `Symbol` on the next line.";
+        assert_eq!(extract_code_idents(body), vec!["Symbol"]);
+    }
+
+    #[test]
+    fn test_find_table_paths_reads_the_file_registry() {
+        let body = "\
+## File Registry
+
+| Source File | Feature | Component |
+|------------|---------|-----------|
+| src/controllers/UserController.java | user-management | user-controller |
+| `src/services/AuthService.java` | authentication | auth-service |
+
+## Features
+
+| Feature | Note | Description | Status |
+|---------|------|-------------|--------|
+| auth | features/auth.md | Login | active |
+";
+        assert_eq!(
+            find_table_paths(body),
+            vec![
+                "src/controllers/UserController.java",
+                "src/services/AuthService.java",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ref_matches_path() {
+        let target = Path::new("/repo/src/auth/session.rs");
+        assert!(ref_matches_path(Path::new("session.rs"), target));
+        assert!(ref_matches_path(Path::new("auth/session.rs"), target));
+        assert!(ref_matches_path(Path::new("src/auth/session.rs"), target));
+
+        // Regression: plain string `ends_with` attached every note about
+        // `session.rs` to any file whose name merely ended in those characters.
+        assert!(!ref_matches_path(
+            Path::new("auth.rs"),
+            Path::new("/repo/src/oauth.rs")
+        ));
+        assert!(!ref_matches_path(Path::new("ssion.rs"), target));
+        assert!(!ref_matches_path(Path::new("other/session.rs"), target));
+        assert!(!ref_matches_path(Path::new(""), target));
+    }
+
+    #[test]
+    fn test_mentions_identifier_respects_boundaries() {
+        assert!(mentions_identifier("The `Index` is rebuilt.", "Index"));
+        assert!(mentions_identifier(
+            "calls parse_note() first",
+            "parse_note"
+        ));
+        assert!(mentions_identifier("case-INSENSITIVE match", "insensitive"));
+
+        // Regression: a substring test called `new` documented by "renewal"
+        // and `Index` documented by "indexing", hiding real symbol drift.
+        assert!(!mentions_identifier("renewal happens nightly", "new"));
+        assert!(!mentions_identifier("indexing is incremental", "index"));
+        assert!(!mentions_identifier("anything at all", ""));
+    }
+
+    #[test]
+    fn test_is_vault_internal() {
+        assert!(is_vault_internal(Path::new(
+            "/v/.doctrack/.obsidian/plugins/x.md"
+        )));
+        assert!(is_vault_internal(Path::new("/v/.doctrack/.trash/old.md")));
+        assert!(!is_vault_internal(Path::new(
+            "/v/.doctrack/features/auth.md"
+        )));
     }
 
     #[test]

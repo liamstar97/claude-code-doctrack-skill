@@ -57,15 +57,23 @@ impl DoctrackMcp {
         let index = Arc::new(Index::new(root.clone(), vault_root.clone()));
 
         if vault_root.exists() {
-            index.build()?;
-            info!(
-                "index ready: {} notes, {} code files, {} links",
-                index.vault_notes.len(),
-                index.code_symbols.len(),
-                index.sym_to_docs.len()
-            );
+            // Building walks the project tree and parses every referenced source
+            // file. On a large repo that is seconds of CPU, so keep it off the
+            // async runtime — the MCP handshake must not wait on it.
+            let build_index = index.clone();
+            tokio::task::spawn_blocking(move || match build_index.build() {
+                Ok(()) => info!(
+                    "index ready: {} notes, {} code files, {} linked symbols",
+                    build_index.vault_notes.len(),
+                    build_index.code_symbols.len(),
+                    build_index.sym_to_docs.len()
+                ),
+                Err(e) => info!("index build error: {e}"),
+            });
         } else {
-            info!("no .doctrack/ vault found — tools will return empty results until vault is created");
+            info!(
+                "no .doctrack/ vault found — tools will return empty results until vault is created"
+            );
         }
 
         // Start file watcher in background
@@ -114,11 +122,9 @@ impl DoctrackMcp {
                             info!("reindexed code file: {}", p.display());
                         }
                         dt_watch::WatchEvent::VaultNoteRemoved(p) => {
-                            index.vault_notes.remove(p);
                             info!("removed vault note from index: {}", p.display());
                         }
                         dt_watch::WatchEvent::CodeFileRemoved(p) => {
-                            index.code_symbols.remove(p);
                             info!("removed code file from index: {}", p.display());
                         }
                     }
@@ -135,9 +141,7 @@ impl DoctrackMcp {
 impl ServerHandler for DoctrackMcp {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder()
-            .enable_tools()
-            .build();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some("Doctrack MCP server. Provides bidirectional code↔documentation index tools for navigating and validating a .doctrack/ knowledge graph vault.".into());
         info
     }
@@ -146,7 +150,10 @@ impl ServerHandler for DoctrackMcp {
 #[tool_router(router = tool_router)]
 impl DoctrackMcp {
     /// Validate a vault note for stale file references, broken wikilinks, and missing backlinks.
-    #[tool(name = "validate_note", description = "Check a vault note for stale file references, broken wikilinks, and other issues. Use after writing or updating a note to ensure all references are valid.")]
+    #[tool(
+        name = "validate_note",
+        description = "Check a vault note for stale file references, broken wikilinks, and other issues. Use after writing or updating a note to ensure all references are valid."
+    )]
     async fn validate_note(&self, Parameters(input): Parameters<ValidateNoteInput>) -> String {
         let note_path = self.index.vault_root.join(&input.note);
 
@@ -167,11 +174,21 @@ impl DoctrackMcp {
                 issues.push(format!(
                     "STALE: `{}` — not found in project{}",
                     file_ref.path.display(),
-                    if file_ref.is_bare_filename { " (bare filename)" } else { "" }
+                    if file_ref.is_bare_filename {
+                        " (bare filename)"
+                    } else {
+                        ""
+                    }
                 ));
             } else if paths.len() > 1 {
-                let locations: Vec<_> = paths.iter()
-                    .map(|p| p.strip_prefix(&self.index.root).unwrap_or(p).display().to_string())
+                let locations: Vec<_> = paths
+                    .iter()
+                    .map(|p| {
+                        p.strip_prefix(&self.index.root)
+                            .unwrap_or(p)
+                            .display()
+                            .to_string()
+                    })
                     .collect();
                 issues.push(format!(
                     "AMBIGUOUS: `{}` resolves to {} files: {}",
@@ -182,15 +199,17 @@ impl DoctrackMcp {
             } else {
                 resolved += 1;
                 // Check line validity
-                if let Some(line) = file_ref.line {
-                    if let Ok(content) = std::fs::read_to_string(&paths[0]) {
-                        let line_count = content.lines().count() as u32;
-                        if line > line_count {
-                            issues.push(format!(
-                                "STALE LINE: `{}:{}` — file only has {} lines",
-                                file_ref.path.display(), line, line_count
-                            ));
-                        }
+                if let Some(line) = file_ref.line
+                    && let Ok(content) = std::fs::read_to_string(&paths[0])
+                {
+                    let line_count = content.lines().count() as u32;
+                    if line > line_count {
+                        issues.push(format!(
+                            "STALE LINE: `{}:{}` — file only has {} lines",
+                            file_ref.path.display(),
+                            line,
+                            line_count
+                        ));
                     }
                 }
             }
@@ -200,26 +219,45 @@ impl DoctrackMcp {
         for link in &note.wikilinks {
             let linked_path = self.index.vault_root.join(format!("{link}.md"));
             if !linked_path.exists() {
-                let found = self.index.vault_notes.iter().any(|entry| {
-                    entry.value().title.eq_ignore_ascii_case(link)
-                });
+                let found = self
+                    .index
+                    .vault_notes
+                    .iter()
+                    .any(|entry| entry.value().title.eq_ignore_ascii_case(link));
                 if !found {
-                    issues.push(format!("BROKEN WIKILINK: [[{link}]] — note not found in vault"));
+                    issues.push(format!(
+                        "BROKEN WIKILINK: [[{link}]] — note not found in vault"
+                    ));
                 }
             }
         }
 
         if issues.is_empty() {
-            format!("✓ {} — all references valid ({} file refs resolved, {} wikilinks OK)",
-                input.note, resolved, note.wikilinks.len())
+            format!(
+                "✓ {} — all references valid ({} file refs resolved, {} wikilinks OK)",
+                input.note,
+                resolved,
+                note.wikilinks.len()
+            )
         } else {
-            format!("⚠ {} — {} issue(s) found:\n{}",
-                input.note, issues.len(), issues.iter().map(|i| format!("  - {i}")).collect::<Vec<_>>().join("\n"))
+            format!(
+                "⚠ {} — {} issue(s) found:\n{}",
+                input.note,
+                issues.len(),
+                issues
+                    .iter()
+                    .map(|i| format!("  - {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         }
     }
 
     /// Get all documentation notes that reference a given code file.
-    #[tool(name = "docs_for_file", description = "Find all vault notes that document or reference a specific code file. Use when you need context about what a file does or want to check if documentation exists for it.")]
+    #[tool(
+        name = "docs_for_file",
+        description = "Find all vault notes that document or reference a specific code file. Use when you need context about what a file does or want to check if documentation exists for it."
+    )]
     async fn docs_for_file(&self, Parameters(input): Parameters<DocsForFileInput>) -> String {
         let abs_path = self.index.root.join(&input.file);
 
@@ -244,100 +282,131 @@ impl DoctrackMcp {
         }
 
         let mut doc_links = Vec::new();
+        let mut possible = Vec::new();
         let mut seen_titles = std::collections::HashSet::new();
 
         for path in &resolved_paths {
             // Ensure the file is indexed
             let _ = self.index.reindex_code_file(path);
 
-            // Check symbol→doc links
+            // Check symbol→doc links. Fuzzy title guesses are reported
+            // separately so they can't be mistaken for real documentation.
             if let Some(symbols) = self.index.code_symbols.get(path) {
                 for sym in symbols.value() {
                     for doc in self.index.docs_for_symbol(path, &sym.name) {
-                        if seen_titles.insert(doc.note_title.clone()) {
-                            doc_links.push(format!(
-                                "- **{}** [{}] documents `{}` ({})\n  {}",
-                                doc.note_title, doc.note_type, sym.name, sym.kind, doc.context
-                            ));
+                        if !seen_titles.insert(doc.note_title.clone()) {
+                            continue;
+                        }
+                        let line = format!(
+                            "- **{}** [{}] documents `{}` ({})\n  {}",
+                            doc.note_title, doc.note_type, sym.name, sym.kind, doc.context
+                        );
+                        if doc.confidence.is_verified() {
+                            doc_links.push(line);
+                        } else {
+                            possible.push(line);
                         }
                     }
                 }
             }
 
             // Also find notes that reference this file path directly
-            let rel_path = path.strip_prefix(&self.index.root).unwrap_or(path);
-            let filename = path.file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default();
-
             for entry in self.index.vault_notes.iter() {
                 let note = entry.value();
                 for file_ref in &note.file_refs {
-                    let ref_str = file_ref.path.to_string_lossy();
-                    if ref_str == rel_path.to_string_lossy()
-                        || ref_str.ends_with(&filename)
+                    if dt_index::vault::ref_matches_path(&file_ref.path, path)
+                        && seen_titles.insert(note.title.clone())
                     {
-                        if seen_titles.insert(note.title.clone()) {
-                            doc_links.push(format!(
-                                "- **{}** [{}] references this file directly",
-                                note.title, note.note_type
-                            ));
-                        }
+                        doc_links.push(format!(
+                            "- **{}** [{}] references this file directly",
+                            note.title, note.note_type
+                        ));
                     }
                 }
             }
         }
 
-        let rel = resolved_paths.first()
+        let rel = resolved_paths
+            .first()
             .and_then(|p| p.strip_prefix(&self.index.root).ok())
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| input.file.clone());
 
-        if doc_links.is_empty() {
-            format!("No documentation found for `{}`. Consider creating a vault note for it.", rel)
+        let mut out = if doc_links.is_empty() {
+            format!("No documentation found for `{rel}`. Consider creating a vault note for it.")
         } else {
             format!("Documentation for `{}`:\n\n{}", rel, doc_links.join("\n"))
+        };
+
+        if !possible.is_empty() {
+            out.push_str(&format!(
+                "\n\nPossibly related (fuzzy title match — verify before relying on these):\n\n{}",
+                possible.join("\n")
+            ));
         }
+
+        out
     }
 
     /// Find where a symbol (function, class, struct, etc.) is defined across the codebase.
-    #[tool(name = "resolve_symbol", description = "Look up where a symbol is defined in the codebase and which vault notes reference it. Use when writing documentation to get accurate file paths and line numbers for a symbol.")]
+    #[tool(
+        name = "resolve_symbol",
+        description = "Look up where a symbol is defined in the codebase and which vault notes reference it. Use when writing documentation to get accurate file paths and line numbers for a symbol."
+    )]
     async fn resolve_symbol(&self, Parameters(input): Parameters<ResolveSymbolInput>) -> String {
         let mut results = Vec::new();
 
-        for entry in self.index.code_symbols.iter() {
-            let file = entry.key();
-            for sym in entry.value() {
-                if sym.name == input.name {
-                    let rel_path = file.strip_prefix(&self.index.root)
-                        .unwrap_or(file)
-                        .display();
-                    let docs = self.index.docs_for_symbol(file, &sym.name);
-                    let doc_info = if docs.is_empty() {
-                        "no documentation".to_string()
-                    } else {
-                        let titles: Vec<_> = docs.iter().map(|d| d.note_title.as_str()).collect();
-                        format!("documented in: {}", titles.join(", "))
-                    };
-                    results.push(format!(
-                        "- {} `{}` at `{}` (L{}-L{}) — {}",
-                        sym.kind, sym.name, rel_path,
-                        sym.start_line + 1, sym.end_line + 1,
-                        doc_info
-                    ));
-                }
+        for id in self.index.definitions_of(&input.name) {
+            let Some(symbols) = self.index.code_symbols.get(&id.file) else {
+                continue;
+            };
+            let rel_path = id
+                .file
+                .strip_prefix(&self.index.root)
+                .unwrap_or(&id.file)
+                .display();
+            for sym in symbols.value().iter().filter(|s| s.name == input.name) {
+                let docs = self.index.verified_docs_for_symbol(&id.file, &sym.name);
+                let doc_info = if docs.is_empty() {
+                    "no documentation".to_string()
+                } else {
+                    let titles: Vec<_> = docs.iter().map(|d| d.note_title.as_str()).collect();
+                    format!("documented in: {}", titles.join(", "))
+                };
+                results.push(format!(
+                    "- {} `{}` at `{}` (L{}-L{}) — {}",
+                    sym.kind,
+                    sym.name,
+                    rel_path,
+                    sym.start_line + 1,
+                    sym.end_line + 1,
+                    doc_info
+                ));
             }
         }
 
-        // Also check the file lookup for unindexed files
-        if let Some(paths) = self.index.file_lookup.get(&format!("{}.java", input.name)) {
-            for path in paths.value() {
-                let rel = path.strip_prefix(&self.index.root).unwrap_or(path).display();
-                if !results.iter().any(|r: &String| r.contains(&rel.to_string())) {
-                    results.push(format!("- file `{}` (not yet symbol-indexed)", rel));
+        // A file named after the symbol is a strong hint even when we couldn't
+        // parse symbols out of it (unsupported language, parse error).
+        for entry in self.index.file_lookup.iter() {
+            let stem = std::path::Path::new(entry.key())
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if stem != input.name {
+                continue;
+            }
+            for path in entry.value() {
+                if self.index.code_symbols.contains_key(path) {
+                    continue;
                 }
+                let rel = path
+                    .strip_prefix(&self.index.root)
+                    .unwrap_or(path)
+                    .display();
+                results.push(format!("- file `{rel}` (not yet symbol-indexed)"));
             }
         }
+        results.sort();
 
         if results.is_empty() {
             format!("Symbol `{}` not found in indexed code files", input.name)
@@ -347,7 +416,10 @@ impl DoctrackMcp {
     }
 
     /// Check which vault notes are impacted by changes to a code file.
-    #[tool(name = "check_impact", description = "After modifying a code file, check which vault notes reference it and may need updating. Use after renaming functions, moving files, or making significant code changes.")]
+    #[tool(
+        name = "check_impact",
+        description = "After modifying a code file, check which vault notes reference it and may need updating. Use after renaming functions, moving files, or making significant code changes."
+    )]
     async fn check_impact(&self, Parameters(input): Parameters<CheckImpactInput>) -> String {
         let abs_path = self.index.root.join(&input.file);
 
@@ -360,61 +432,99 @@ impl DoctrackMcp {
 
         let mut impacted = Vec::new();
         for sym in symbols.value() {
-            for doc in self.index.docs_for_symbol(&abs_path, &sym.name) {
-                impacted.push(format!(
+            for doc in self.index.verified_docs_for_symbol(&abs_path, &sym.name) {
+                let line = format!(
                     "- **{}** [{}] references `{}`",
                     doc.note_title, doc.note_type, sym.name
-                ));
-            }
-        }
-
-        // Also check for notes that reference the file path directly
-        let filename = abs_path.file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        for entry in self.index.vault_notes.iter() {
-            let note = entry.value();
-            for file_ref in &note.file_refs {
-                let ref_str = file_ref.path.to_string_lossy();
-                if ref_str.ends_with(&filename) || ref_str == input.file {
-                    let line = format!(
-                        "- **{}** [{}] has file reference to `{}`",
-                        note.title, note.note_type, file_ref.path.display()
-                    );
-                    if !impacted.contains(&line) {
-                        impacted.push(line);
-                    }
+                );
+                if !impacted.contains(&line) {
+                    impacted.push(line);
                 }
             }
         }
 
-        impacted.dedup();
+        // Also check for notes that reference the file path directly
+        for entry in self.index.vault_notes.iter() {
+            let note = entry.value();
+            for file_ref in &note.file_refs {
+                if !dt_index::vault::ref_matches_path(&file_ref.path, &abs_path) {
+                    continue;
+                }
+                let line = format!(
+                    "- **{}** [{}] has file reference to `{}`",
+                    note.title,
+                    note.note_type,
+                    file_ref.path.display()
+                );
+                if !impacted.contains(&line) {
+                    impacted.push(line);
+                }
+            }
+        }
 
         if impacted.is_empty() {
-            format!("No vault notes reference `{}` — no documentation impact.", input.file)
+            format!(
+                "No vault notes reference `{}` — no documentation impact.",
+                input.file
+            )
         } else {
             format!(
                 "Changes to `{}` may affect {} vault note(s):\n\n{}",
-                input.file, impacted.len(), impacted.join("\n")
+                input.file,
+                impacted.len(),
+                impacted.join("\n")
             )
         }
     }
 
     /// Get a coverage report showing which code files lack documentation.
-    #[tool(name = "coverage_report", description = "Get a summary of documentation coverage — which files are documented, which aren't, and overall vault health. Use to identify gaps in documentation.")]
+    #[tool(
+        name = "coverage_report",
+        description = "Get a summary of documentation coverage — which files are documented, which aren't, and overall vault health. Use to identify gaps in documentation."
+    )]
     async fn coverage_report(&self) -> String {
         let total_notes = self.index.vault_notes.len();
         let total_code_files = self.index.code_symbols.len();
-        let linked_notes = self.index.doc_to_syms.len();
-        let total_links: usize = self.index.sym_to_docs.iter().map(|e| e.value().len()).sum();
+        // Only notes with at least one verified link count as linked — a fuzzy
+        // title guess is not evidence that a note documents anything.
+        let linked_notes = self
+            .index
+            .doc_to_syms
+            .iter()
+            .filter(|e| e.value().iter().any(|r| r.confidence.is_verified()))
+            .count();
+        let total_links: usize = self
+            .index
+            .sym_to_docs
+            .iter()
+            .map(|e| {
+                e.value()
+                    .iter()
+                    .filter(|d| d.confidence.is_verified())
+                    .count()
+            })
+            .sum();
+        let fuzzy_links: usize = self
+            .index
+            .sym_to_docs
+            .iter()
+            .map(|e| {
+                e.value()
+                    .iter()
+                    .filter(|d| !d.confidence.is_verified())
+                    .count()
+            })
+            .sum();
 
         // Find undocumented code files
         let mut undocumented = Vec::new();
         for entry in self.index.code_symbols.iter() {
             let file = entry.key();
             let has_docs = entry.value().iter().any(|sym| {
-                !self.index.docs_for_symbol(file, &sym.name).is_empty()
+                !self
+                    .index
+                    .verified_docs_for_symbol(file, &sym.name)
+                    .is_empty()
             });
             if !has_docs {
                 let rel = file.strip_prefix(&self.index.root).unwrap_or(file);
@@ -445,10 +555,11 @@ impl DoctrackMcp {
             |---|---|\n\
             | Vault notes | {} |\n\
             | Code files indexed | {} |\n\
-            | Sym↔Doc links | {} |\n\
+            | Sym↔Doc links (verified) | {} |\n\
+            | Sym↔Doc links (fuzzy) | {} |\n\
             | Link coverage | {}% of notes |\n\
             | Stale references | {} |\n",
-            total_notes, total_code_files, total_links, coverage_pct, stale_count
+            total_notes, total_code_files, total_links, fuzzy_links, coverage_pct, stale_count
         );
 
         if !undocumented.is_empty() {
@@ -468,7 +579,10 @@ impl DoctrackMcp {
     }
 
     /// Report all stale references across the vault.
-    #[tool(name = "stale_report", description = "Get a full list of all stale file references and broken wikilinks across the vault. Use to identify documentation that needs updating.")]
+    #[tool(
+        name = "stale_report",
+        description = "Get a full list of all stale file references and broken wikilinks across the vault. Use to identify documentation that needs updating."
+    )]
     async fn stale_report(&self) -> String {
         let mut stale_files = Vec::new();
         let mut broken_wikilinks = Vec::new();
@@ -480,7 +594,8 @@ impl DoctrackMcp {
                 if self.index.resolve_file_ref(file_ref).is_empty() {
                     stale_files.push(format!(
                         "- **{}**: `{}` not found",
-                        note.title, file_ref.path.display()
+                        note.title,
+                        file_ref.path.display()
                     ));
                 }
             }
@@ -488,14 +603,14 @@ impl DoctrackMcp {
             for link in &note.wikilinks {
                 let linked_path = self.index.vault_root.join(format!("{link}.md"));
                 if !linked_path.exists() {
-                    let found = self.index.vault_notes.iter().any(|e| {
-                        e.value().title.eq_ignore_ascii_case(link)
-                    });
+                    let found = self
+                        .index
+                        .vault_notes
+                        .iter()
+                        .any(|e| e.value().title.eq_ignore_ascii_case(link));
                     if !found {
-                        broken_wikilinks.push(format!(
-                            "- **{}**: [[{}]] not found",
-                            note.title, link
-                        ));
+                        broken_wikilinks
+                            .push(format!("- **{}**: [[{}]] not found", note.title, link));
                     }
                 }
             }
@@ -508,7 +623,10 @@ impl DoctrackMcp {
         }
 
         if !stale_files.is_empty() {
-            report.push_str(&format!("### Stale file references ({})\n\n", stale_files.len()));
+            report.push_str(&format!(
+                "### Stale file references ({})\n\n",
+                stale_files.len()
+            ));
             for s in &stale_files {
                 report.push_str(s);
                 report.push('\n');
@@ -516,7 +634,10 @@ impl DoctrackMcp {
         }
 
         if !broken_wikilinks.is_empty() {
-            report.push_str(&format!("\n### Broken wikilinks ({})\n\n", broken_wikilinks.len()));
+            report.push_str(&format!(
+                "\n### Broken wikilinks ({})\n\n",
+                broken_wikilinks.len()
+            ));
             for w in &broken_wikilinks {
                 report.push_str(w);
                 report.push('\n');
@@ -527,7 +648,10 @@ impl DoctrackMcp {
     }
 
     /// Generate a refresh plan for stale documentation.
-    #[tool(name = "refresh_docs", description = "Scan the vault and generate a prioritized plan of documentation that needs updating. Compares note last_updated timestamps against code file modification times, detects symbol drift (renamed/added/removed), and identifies undocumented code. Returns an actionable list — use it to drive targeted doc updates. Idempotent: run again after updating to verify nothing remains stale.")]
+    #[tool(
+        name = "refresh_docs",
+        description = "Scan the vault and generate a prioritized plan of documentation that needs updating. Compares note last_updated timestamps against code file modification times, detects symbol drift (renamed/added/removed), and identifies undocumented code. Returns an actionable list — use it to drive targeted doc updates. Idempotent: run again after updating to verify nothing remains stale."
+    )]
     async fn refresh_docs(&self) -> String {
         #[derive(Debug)]
         struct StaleNote {
@@ -547,13 +671,18 @@ impl DoctrackMcp {
             let mut reasons = Vec::new();
             let mut priority = 0u32;
 
-            let note_rel = note.path.strip_prefix(&self.index.vault_root)
+            let note_rel = note
+                .path
+                .strip_prefix(&self.index.vault_root)
                 .unwrap_or(&note.path)
                 .display()
                 .to_string();
 
             // Parse note's last_updated date
-            let note_updated = note.frontmatter.last_updated.as_ref()
+            let note_updated = note
+                .frontmatter
+                .last_updated
+                .as_ref()
                 .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
 
             // Check each referenced code file
@@ -571,36 +700,47 @@ impl DoctrackMcp {
 
                 for abs_path in &resolved {
                     // Compare file mtime against note last_updated
-                    if let (Some(note_date), Ok(metadata)) = (note_updated, std::fs::metadata(abs_path)) {
-                        if let Ok(modified) = metadata.modified() {
-                            let file_date = chrono::DateTime::<chrono::Utc>::from(modified)
-                                .date_naive();
-                            if file_date > note_date {
-                                let days_stale = (file_date - note_date).num_days();
-                                let rel = abs_path.strip_prefix(&self.index.root)
-                                    .unwrap_or(abs_path)
-                                    .display();
-                                reasons.push(format!(
-                                    "Code newer: `{}` modified {} day(s) after note was last updated",
-                                    rel, days_stale
-                                ));
-                                priority += if days_stale > 30 { 3 } else if days_stale > 7 { 2 } else { 1 };
-                            }
+                    if let (Some(note_date), Ok(metadata)) =
+                        (note_updated, std::fs::metadata(abs_path))
+                        && let Ok(modified) = metadata.modified()
+                    {
+                        let file_date =
+                            chrono::DateTime::<chrono::Utc>::from(modified).date_naive();
+                        if file_date > note_date {
+                            let days_stale = (file_date - note_date).num_days();
+                            let rel = abs_path
+                                .strip_prefix(&self.index.root)
+                                .unwrap_or(abs_path)
+                                .display();
+                            reasons.push(format!(
+                                "Code newer: `{}` modified {} day(s) after note was last updated",
+                                rel, days_stale
+                            ));
+                            priority += if days_stale > 30 {
+                                3
+                            } else if days_stale > 7 {
+                                2
+                            } else {
+                                1
+                            };
                         }
                     }
 
                     // Check for symbol drift — symbols in code that the note might be missing
                     if let Some(symbols) = self.index.code_symbols.get(abs_path) {
-                        let body_lower = note.body.to_lowercase();
                         let mut missing_symbols = Vec::new();
                         for sym in symbols.value() {
-                            // If a symbol exists in the code but isn't mentioned in the note body
-                            if !body_lower.contains(&sym.name.to_lowercase()) {
+                            // If a symbol exists in the code but isn't mentioned in
+                            // the note body. Identifier boundaries matter here: a
+                            // substring test reports `new` as documented by the word
+                            // "renewal" and `Index` by the word "index".
+                            if !dt_index::vault::mentions_identifier(&note.body, &sym.name) {
                                 missing_symbols.push(format!("`{}`", sym.name));
                             }
                         }
                         if !missing_symbols.is_empty() && missing_symbols.len() <= 10 {
-                            let rel = abs_path.strip_prefix(&self.index.root)
+                            let rel = abs_path
+                                .strip_prefix(&self.index.root)
                                 .unwrap_or(abs_path)
                                 .display();
                             reasons.push(format!(
@@ -618,9 +758,11 @@ impl DoctrackMcp {
             for link in &note.wikilinks {
                 let linked_path = self.index.vault_root.join(format!("{link}.md"));
                 if !linked_path.exists() {
-                    let found = self.index.vault_notes.iter().any(|e| {
-                        e.value().title.eq_ignore_ascii_case(link)
-                    });
+                    let found = self
+                        .index
+                        .vault_notes
+                        .iter()
+                        .any(|e| e.value().title.eq_ignore_ascii_case(link));
                     if !found {
                         reasons.push(format!("Broken wikilink: [[{link}]]"));
                         priority += 1;
@@ -630,7 +772,8 @@ impl DoctrackMcp {
 
             // Check if note has no last_updated at all
             if note.frontmatter.last_updated.is_none() && !note.file_refs.is_empty() {
-                reasons.push("Missing `last_updated` frontmatter — can't track staleness".to_string());
+                reasons
+                    .push("Missing `last_updated` frontmatter — can't track staleness".to_string());
                 priority += 1;
             }
 
@@ -649,10 +792,14 @@ impl DoctrackMcp {
         for entry in self.index.code_symbols.iter() {
             let file = entry.key();
             let has_docs = entry.value().iter().any(|sym| {
-                !self.index.docs_for_symbol(file, &sym.name).is_empty()
+                !self
+                    .index
+                    .verified_docs_for_symbol(file, &sym.name)
+                    .is_empty()
             });
             if !has_docs {
-                let rel = file.strip_prefix(&self.index.root)
+                let rel = file
+                    .strip_prefix(&self.index.root)
                     .unwrap_or(file)
                     .display()
                     .to_string();
@@ -682,9 +829,21 @@ impl DoctrackMcp {
             }
 
             let skip_dirs = [
-                "target", "node_modules", ".git", ".doctrack", ".idea",
-                ".vscode", "build", "dist", "out", "__pycache__", ".gradle",
-                "vendor", ".next", ".claude", ".agents",
+                "target",
+                "node_modules",
+                ".git",
+                ".doctrack",
+                ".idea",
+                ".vscode",
+                "build",
+                "dist",
+                "out",
+                "__pycache__",
+                ".gradle",
+                "vendor",
+                ".next",
+                ".claude",
+                ".agents",
             ];
 
             for entry in walkdir::WalkDir::new(&self.index.root)
@@ -692,8 +851,7 @@ impl DoctrackMcp {
                 .filter_entry(|e| {
                     let name = e.file_name().to_string_lossy();
                     if e.file_type().is_dir() {
-                        return !skip_dirs.contains(&name.as_ref())
-                            && !name.starts_with('.');
+                        return !skip_dirs.contains(&name.as_ref()) && !name.starts_with('.');
                     }
                     true
                 })
@@ -704,7 +862,8 @@ impl DoctrackMcp {
                 }
                 let path = entry.path();
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let filename = path.file_name()
+                let filename = path
+                    .file_name()
                     .map(|f| f.to_string_lossy().to_string())
                     .unwrap_or_default();
 
@@ -718,26 +877,25 @@ impl DoctrackMcp {
                     continue;
                 }
 
-                let rel = path.strip_prefix(&self.index.root)
+                let rel = path
+                    .strip_prefix(&self.index.root)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .to_string();
 
                 // Skip if already imported
-                if imported_paths.contains(&rel)
-                    || imported_paths.contains(&filename)
-                {
+                if imported_paths.contains(&rel) || imported_paths.contains(&filename) {
                     continue;
                 }
 
                 // Skip if there's a vault note with a matching title
-                let stem = path.file_stem()
+                let stem = path
+                    .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let already_in_vault = self.index.vault_notes.iter().any(|e| {
                     let title = &e.value().title;
-                    title.eq_ignore_ascii_case(&stem)
-                        || title.eq_ignore_ascii_case(&filename)
+                    title.eq_ignore_ascii_case(&stem) || title.eq_ignore_ascii_case(&filename)
                 });
                 if already_in_vault {
                     continue;
@@ -758,7 +916,10 @@ impl DoctrackMcp {
         let mut report = String::from("## Documentation Refresh Plan\n\n");
 
         if !stale_notes.is_empty() {
-            report.push_str(&format!("### Stale notes ({} need updating)\n\n", stale_notes.len()));
+            report.push_str(&format!(
+                "### Stale notes ({} need updating)\n\n",
+                stale_notes.len()
+            ));
 
             for (i, note) in stale_notes.iter().enumerate() {
                 let priority_label = match note.priority {
@@ -768,7 +929,11 @@ impl DoctrackMcp {
                 };
                 report.push_str(&format!(
                     "**{}. {} [{}]** — `{}` (priority: {})\n",
-                    i + 1, note.note_title, note.note_type, note.note_path, priority_label
+                    i + 1,
+                    note.note_title,
+                    note.note_type,
+                    note.note_path,
+                    priority_label
                 ));
                 for reason in &note.reasons {
                     report.push_str(&format!("   - {reason}\n"));
@@ -803,13 +968,18 @@ impl DoctrackMcp {
             }
         }
 
-        report.push_str("\n---\n*Run `refresh_docs` again after updating to verify all issues are resolved.*");
+        report.push_str(
+            "\n---\n*Run `refresh_docs` again after updating to verify all issues are resolved.*",
+        );
 
         report
     }
 
     /// Search the index for notes, symbols, or files matching a query.
-    #[tool(name = "search_index", description = "Fuzzy search across vault notes, code symbols, and file paths. Use when you need to find related documentation or code by keyword.")]
+    #[tool(
+        name = "search_index",
+        description = "Fuzzy search across vault notes, code symbols, and file paths. Use when you need to find related documentation or code by keyword."
+    )]
     async fn search_index(&self, Parameters(input): Parameters<SearchIndexInput>) -> String {
         use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
         use nucleo_matcher::{Config, Matcher};
@@ -818,7 +988,8 @@ impl DoctrackMcp {
 
         // Split query into tokens for multi-word matching
         let tokens: Vec<&str> = input.query.split_whitespace().collect();
-        let patterns: Vec<Pattern> = tokens.iter()
+        let patterns: Vec<Pattern> = tokens
+            .iter()
             .map(|t| Pattern::parse(t, CaseMatching::Ignore, Normalization::Smart))
             .collect();
 
@@ -840,10 +1011,13 @@ impl DoctrackMcp {
 
             let score = multi_token_score(&searchable, &patterns, &combined, &mut matcher);
             if score > 0 {
-                results.push((score, format!(
-                    "- **Note**: {} [{}] (score: {})",
-                    note.title, note.note_type, score
-                )));
+                results.push((
+                    score,
+                    format!(
+                        "- **Note**: {} [{}] (score: {})",
+                        note.title, note.note_type, score
+                    ),
+                ));
             }
         }
 
@@ -855,10 +1029,17 @@ impl DoctrackMcp {
                 let searchable = format!("{} {}", sym.name, rel.display());
                 let score = multi_token_score(&searchable, &patterns, &combined, &mut matcher);
                 if score > 0 {
-                    results.push((score, format!(
-                        "- **Symbol**: {} `{}` in `{}` L{} (score: {})",
-                        sym.kind, sym.name, rel.display(), sym.start_line + 1, score
-                    )));
+                    results.push((
+                        score,
+                        format!(
+                            "- **Symbol**: {} `{}` in `{}` L{} (score: {})",
+                            sym.kind,
+                            sym.name,
+                            rel.display(),
+                            sym.start_line + 1,
+                            score
+                        ),
+                    ));
                 }
             }
         }
@@ -870,7 +1051,11 @@ impl DoctrackMcp {
             format!("No results found for `{}`", input.query)
         } else {
             let lines: Vec<_> = results.iter().map(|(_, line)| line.as_str()).collect();
-            format!("Search results for `{}`:\n\n{}", input.query, lines.join("\n"))
+            format!(
+                "Search results for `{}`:\n\n{}",
+                input.query,
+                lines.join("\n")
+            )
         }
     }
 }
@@ -894,7 +1079,11 @@ fn multi_token_score(
 
     // If single token query, just use combined
     if token_patterns.len() <= 1 {
-        return if combined_score > threshold { combined_score } else { 0 };
+        return if combined_score > threshold {
+            combined_score
+        } else {
+            0
+        };
     }
 
     // For multi-token: each token must match, sum their scores
@@ -902,10 +1091,9 @@ fn multi_token_score(
     let mut all_matched = true;
     for pattern in token_patterns {
         let mut buf = Vec::new();
-        if let Some(score) = pattern.score(
-            nucleo_matcher::Utf32Str::new(haystack, &mut buf),
-            matcher,
-        ) {
+        if let Some(score) =
+            pattern.score(nucleo_matcher::Utf32Str::new(haystack, &mut buf), matcher)
+        {
             if score > threshold {
                 total = total.saturating_add(score);
             } else {
@@ -921,5 +1109,9 @@ fn multi_token_score(
     let multi_score = if all_matched { total } else { 0 };
 
     // Return the better of the two approaches
-    multi_score.max(if combined_score > threshold { combined_score } else { 0 })
+    multi_score.max(if combined_score > threshold {
+        combined_score
+    } else {
+        0
+    })
 }

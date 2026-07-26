@@ -60,9 +60,10 @@ pub fn check_note(index: &Index, note_path: &Path) -> Vec<Diagnostic> {
         let linked_path = index.vault_root.join(format!("{link}.md"));
         if !linked_path.exists() {
             // Try case-insensitive search
-            let found = index.vault_notes.iter().any(|entry| {
-                entry.value().title.eq_ignore_ascii_case(link)
-            });
+            let found = index
+                .vault_notes
+                .iter()
+                .any(|entry| entry.value().title.eq_ignore_ascii_case(link));
 
             if !found {
                 diagnostics.push(Diagnostic {

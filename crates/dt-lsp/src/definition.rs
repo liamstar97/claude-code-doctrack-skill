@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use tower_lsp::lsp_types::*;
 
 use dt_index::Index;
@@ -11,7 +9,7 @@ pub fn handle_goto_definition(
 ) -> Option<GotoDefinitionResponse> {
     let uri = &params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
-    let path = PathBuf::from(uri.path());
+    let path = uri.to_file_path().ok()?;
 
     // From code: jump to the vault note documenting this symbol
     if let Some(symbols) = index.code_symbols.get(&path) {
@@ -33,7 +31,9 @@ pub fn handle_goto_definition(
                         .collect();
 
                     if locations.len() == 1 {
-                        return Some(GotoDefinitionResponse::Scalar(locations.into_iter().next().unwrap()));
+                        return Some(GotoDefinitionResponse::Scalar(
+                            locations.into_iter().next().unwrap(),
+                        ));
                     } else if !locations.is_empty() {
                         return Some(GotoDefinitionResponse::Array(locations));
                     }
@@ -43,22 +43,25 @@ pub fn handle_goto_definition(
     }
 
     // From vault note: jump to the code file/symbol referenced
-    if path.starts_with(&index.vault_root) {
-        if let Some(note) = index.vault_notes.get(&path) {
-            // Find the file ref closest to the cursor line
-            for file_ref in &note.file_refs {
-                let abs_path = index.root.join(&file_ref.path);
-                if abs_path.exists() {
-                    let uri = Url::from_file_path(&abs_path).ok()?;
-                    let line = file_ref.line.unwrap_or(0);
-                    return Some(GotoDefinitionResponse::Scalar(Location {
-                        uri,
-                        range: Range {
-                            start: Position::new(line, 0),
-                            end: Position::new(line, 0),
-                        },
-                    }));
-                }
+    if path.starts_with(&index.vault_root)
+        && let Some(note) = index.vault_notes.get(&path)
+    {
+        // Jump to the first file reference that resolves. Going through
+        // resolve_file_ref (rather than joining onto the project root)
+        // means bare filenames and partial paths work here too.
+        for file_ref in &note.file_refs {
+            for abs_path in index.resolve_file_ref(file_ref) {
+                let Ok(uri) = Url::from_file_path(&abs_path) else {
+                    continue;
+                };
+                let line = file_ref.line.unwrap_or(0);
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri,
+                    range: Range {
+                        start: Position::new(line, 0),
+                        end: Position::new(line, 0),
+                    },
+                }));
             }
         }
     }

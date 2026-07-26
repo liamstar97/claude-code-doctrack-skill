@@ -1,129 +1,159 @@
 # Contributing to Doctrack
 
-Thanks for your interest in improving Doctrack! This guide covers how the skill works and how to make changes.
+> [!NOTE]
+> Standalone doctrack is frozen — see the warning in [README.md](README.md). It
+> still accepts correctness fixes, tests, and documentation; the same code is
+> carried forward into Switchyard's bundled doctrack plugin, so fixes here are
+> not wasted.
 
 ## Repository structure
 
 ```
 doctrack/
-├── doctrack/
-│   └── SKILL.md              # The skill — knowledge graph schema and workflows
-├── doctrack.skill             # Packaged skill file (zip archive)
-├── doctrack-workspace/        # Test workspace (not shipped)
-│   ├── evals/
-│   │   └── evals.json         # Test case definitions
-│   └── iteration-*/           # Test run results
-├── README.md
-├── CONTRIBUTING.md
-├── LICENSE
-└── .mcp.json                  # MCP config for testing (not shipped)
+├── crates/
+│   ├── dt-index/             # The code↔doc index. Everything else wraps this.
+│   │   ├── src/vault.rs      #   Parse a note: frontmatter, refs, wikilinks, idents
+│   │   ├── src/symbols.rs    #   Tree-sitter symbol extraction, per language
+│   │   ├── src/matching.rs   #   Link notes to symbols across three confidence tiers
+│   │   ├── src/index.rs      #   The maps, resolution, and incremental updates
+│   │   └── tests/            #   Fixture-based end-to-end tests
+│   ├── dt-mcp/               # MCP server + one-shot CLI (binary: doctrack-mcp)
+│   ├── dt-lsp/               # LSP server for editors (binary: doctrack-lsp)
+│   └── dt-watch/             # File watcher feeding incremental index updates
+├── skills/doctrack/SKILL.md  # The skill — knowledge graph schema and workflows
+├── scripts/evaluate_vault.py # Vault quality benchmarking
+├── benchmarks/               # Recorded benchmark runs
+├── docs/ANALYSIS.md          # Architecture and known-issue backlog
+└── .github/workflows/ci.yml  # fmt, clippy, test
 ```
 
 ## Architecture
 
-Doctrack is a **two-skill system**:
+Doctrack has two halves that are worth keeping straight.
 
-1. **Doctrack** (`doctrack/SKILL.md`) — Defines the knowledge graph: what notes to create, what structure, what frontmatter, what wikilinks. This is what you edit.
-2. **Obsidian skill** (`bitbonsai/mcpvault`) — Handles vault I/O via MCP tools. This is an external dependency.
+**The skill** (`skills/doctrack/SKILL.md`) defines the knowledge graph: what notes
+to create, what frontmatter, what wikilinks, what tags. It never calls MCP tools
+directly — it describes *what* to do and delegates the mechanics of reading and
+writing notes to the obsidian skill ([bitbonsai/mcpvault](https://github.com/bitbonsai/mcpvault)).
 
-Doctrack never calls MCP tools directly in its instructions — it describes **what** to do ("write a feature note", "tag it", "search for existing notes") and the obsidian skill figures out **how**.
+**The Rust workspace** builds a bidirectional index between code symbols and
+vault notes, and exposes it two ways: as MCP tools for Claude Code, and as an
+LSP server for editors. The dependency order is
+`dt-index ← dt-watch ← {dt-mcp, dt-lsp}`; `dt-index` has no knowledge of MCP or
+LSP and should stay that way.
 
-## Making changes
+### How linking works
 
-### 1. Edit SKILL.md
+`Index::build` runs four phases: walk the project for a filename lookup table,
+parse every vault note, extract symbols from every parseable source file, then
+link notes to symbols. Links carry a `MatchConfidence`:
 
-All doctrack logic lives in `doctrack/SKILL.md`. Key sections:
+| Tier | Confidence | Source |
+|------|-----------|--------|
+| 1 | `Exact` | A file reference in frontmatter, a registry table, or a backtick path that resolves to a real file |
+| 2 | `Strong` | A backtick identifier in prose matching a parsed symbol name |
+| 3 | `Fuzzy` | Title-to-filename similarity, used only when the note has no `Exact` link |
+
+**`Fuzzy` links are guesses.** Anything that reports documentation as fact —
+coverage numbers, `check_impact`, "undocumented files" — must filter them out
+with `MatchConfidence::is_verified()` or `Index::verified_docs_for_symbol`.
+
+## Working on the Rust crates
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+CI runs all three plus a release build of both binaries. Keep it green.
+
+### Adding a language
+
+1. Add the `tree-sitter-*` grammar to `[workspace.dependencies]` and to
+   `crates/dt-index/Cargo.toml`.
+2. Add a `*_queries()` function and a `language_for()` arm in `symbols.rs`.
+3. Add the extension to `SUPPORTED_EXTENSIONS`.
+4. Add an `extracts_<language>_symbols` test.
+
+Step 4 is not optional. A malformed tree-sitter query fails to compile at
+runtime, which makes `extract_symbols` return `Err` for *every* file of that
+language — and `Index::build` logs that at debug and carries on. TypeScript was
+silently unsupported for exactly this reason until a test caught it. The
+`every_language_query_compiles` test is the backstop.
+
+### Testing against a real project
+
+```bash
+cargo build --release
+export PATH="$PWD/target/release:$PATH"
+
+cd /path/to/some/project
+DOCTRACK_ROOT="$(pwd)" doctrack-mcp --coverage
+DOCTRACK_ROOT="$(pwd)" doctrack-mcp --check-impact src/some/file.rs
+DOCTRACK_ROOT="$(pwd)" doctrack-mcp --validate-note features/auth.md
+doctrack-lsp --check "$(pwd)"          # full index dump, useful for debugging
+```
+
+Set `RUST_LOG=dt_index=debug` to see what the indexer skipped and why.
+
+## Working on the skill
+
+All skill logic lives in `skills/doctrack/SKILL.md`.
 
 | Section | What it controls |
 |---------|-----------------|
-| **Knowledge graph structure** | Node types, wikilink patterns |
-| **Tag taxonomy** | How notes are categorized |
-| **Session init** | How Claude orients at session start |
-| **Note templates** | Frontmatter and content structure for each note type |
-| **Project initialization** | The full init workflow |
-| **Version tracking** | Migration paths between versions |
+| Knowledge graph structure | Node types, wikilink patterns |
+| Tag taxonomy | How notes are categorized |
+| Session init | How Claude orients at session start |
+| Note templates | Frontmatter and content structure per note type |
+| Project initialization | The full init workflow |
+| Version tracking | Migration paths between versions |
 
-**Tips:**
-- Explain "why" not just "what" — Claude follows instructions better with reasoning
-- Use templates and examples — they produce consistent output
-- Test on real codebases, not just mock projects
+Tips:
 
-### 2. Test your changes
+- Explain "why", not just "what" — Claude follows instructions better with reasoning.
+- Use templates and examples; they produce consistent output.
+- Test on real codebases, not mock projects.
 
-#### Quick test (manual)
+### Measuring skill changes
 
-```bash
-# Install your modified skill
-claude install-skill ./doctrack.skill
-
-# In a project directory:
-# "doctrack init"
-```
-
-#### Full eval suite
-
-If you have the skill-creator skill, run the eval framework:
-
-1. Test cases are in `doctrack-workspace/evals/evals.json`
-2. Spawn test runs with and without the skill
-3. Grade assertions against outputs
-4. Review in the eval viewer
-
-#### Live MCP test
-
-For end-to-end testing with the actual MCP tools:
-
-1. Install mcpvault: `npx skills add bitbonsai/mcpvault --yes`
-2. Create a test vault and configure `.mcp.json`
-3. Run `doctrack init` and verify notes appear in the vault
-4. Open the vault in Obsidian to check the graph view
-
-### 3. Repackage
+`scripts/evaluate_vault.py` scores a vault on coverage, graph density, and
+content quality, and can diff against a previous run:
 
 ```bash
-zip -r doctrack.skill doctrack/
+pip install pyyaml
+python scripts/evaluate_vault.py /path/to/project -o benchmarks/myproject-run1.json
+python scripts/evaluate_vault.py /path/to/project --compare benchmarks/myproject-run1.json
 ```
 
-Or with the skill-creator:
-
-```bash
-claude -p "package the skill at ./doctrack"
-```
-
-### 4. Test the package
-
-```bash
-claude install-skill ./doctrack.skill
-```
+Committed runs live in `benchmarks/`. Record one before and after a substantive
+skill change so the effect is visible rather than asserted.
 
 ## Areas for contribution
 
-### Knowledge graph
-- New node types (e.g., "risk" notes for security concerns, "todo" for planned work)
-- Better concept detection during init
-- Smarter decision extraction from code comments and commit messages
+See [docs/ANALYSIS.md](docs/ANALYSIS.md) for the current backlog with severity
+and rationale. Broad themes:
 
-### Monorepo support
-- Additional detection patterns (Bazel, Pants, custom layouts)
-- Better cross-package dependency tracking
+**Index quality** — confidence calibration, better ambiguity handling, respecting
+`.gitignore` during the project walk.
 
-### Language/framework coverage
-- Framework-specific documentation patterns
-- Language-specific conventions for different tech stacks
+**Knowledge graph** — new node types (risks, planned work), better concept
+detection during init, extracting decisions from commit messages.
 
-### Mermaid diagrams
-- Better diagram templates for specific patterns
-- Auto-generation of dependency graphs from import analysis
+**Monorepo support** — Bazel and Pants detection, cross-package dependency
+tracking. Note that Maven multi-module and git-submodule layouts were missed in
+the last recorded benchmark run.
 
-### Migration
-- Smoother v1/v2 → v3 migration
-- Migration from other documentation systems (JSDoc, Sphinx, etc.)
+**Language coverage** — more grammars, framework-specific documentation patterns.
+
+**Migration** — smoother v1/v2 → v3, and importing from JSDoc, Sphinx, and
+similar.
 
 ## Submitting changes
 
-1. Fork the repository
-2. Create a branch
-3. Edit `SKILL.md`
-4. Test with at least one real project
-5. Repackage the `.skill` file
-6. Open a PR with what you changed, why, and how you tested it
+1. Fork and branch.
+2. Make the change. Add a test that fails without it.
+3. `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
+4. For skill changes, test against at least one real project and record a benchmark.
+5. Open a PR describing what changed, why, and how you verified it.

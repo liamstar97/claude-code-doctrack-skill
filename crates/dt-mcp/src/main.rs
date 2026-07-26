@@ -12,18 +12,18 @@ use tools::DoctrackMcp;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // CLI modes — build index, run check, print results, exit
-    if args.len() >= 3 {
-        match args[1].as_str() {
-            "--check-impact" => return run_check_impact(&args[2]),
-            "--validate-note" => return run_validate_note(&args[2]),
-            _ => {}
-        }
-    }
-    if args.len() >= 2 {
-        match args[1].as_str() {
+    // CLI modes — build index, run check, print results, exit.
+    //
+    // Anything that isn't a recognised, well-formed invocation must fail loudly.
+    // Falling through to the server means a typo'd flag hangs on stdio waiting
+    // for an MCP handshake that will never come.
+    if let Some(flag) = args.first() {
+        let arg = args.get(1);
+        match flag.as_str() {
+            "--check-impact" => return require_arg(flag, arg).and_then(run_check_impact),
+            "--validate-note" => return require_arg(flag, arg).and_then(run_validate_note),
             "--coverage" => return run_coverage(),
             "--setup-hooks" => return setup_hooks(),
             "--version" | "-V" => {
@@ -35,7 +35,11 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             "--update" => return run_update(),
-            _ => {}
+            other => {
+                eprintln!("doctrack-mcp: unrecognised option `{other}`\n");
+                print_help();
+                std::process::exit(2);
+            }
         }
     }
 
@@ -57,6 +61,19 @@ async fn main() -> Result<()> {
     service.waiting().await?;
 
     Ok(())
+}
+
+/// Exit with usage rather than silently starting a server when a flag that
+/// needs a value was given none.
+fn require_arg<'a>(flag: &str, value: Option<&'a String>) -> Result<&'a str> {
+    match value {
+        Some(v) if !v.starts_with('-') => Ok(v.as_str()),
+        _ => {
+            eprintln!("doctrack-mcp: `{flag}` requires an argument\n");
+            print_help();
+            std::process::exit(2);
+        }
+    }
 }
 
 fn project_root() -> PathBuf {
@@ -86,28 +103,10 @@ fn run_check_impact(file: &str) -> Result<()> {
     // Check symbol→doc links
     if let Some(symbols) = index.code_symbols.get(&abs_path) {
         for sym in symbols.value() {
-            for doc in index.docs_for_symbol(&abs_path, &sym.name) {
-                impacted.push(format!(
+            for doc in index.verified_docs_for_symbol(&abs_path, &sym.name) {
+                let line = format!(
                     "  - {} [{}] references `{}`",
                     doc.note_title, doc.note_type, sym.name
-                ));
-            }
-        }
-    }
-
-    // Check notes that reference the file path directly
-    let filename = abs_path.file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    for entry in index.vault_notes.iter() {
-        let note = entry.value();
-        for file_ref in &note.file_refs {
-            let ref_str = file_ref.path.to_string_lossy();
-            if ref_str.ends_with(&filename) || ref_str == file {
-                let line = format!(
-                    "  - {} [{}] has file reference to `{}`",
-                    note.title, note.note_type, file_ref.path.display()
                 );
                 if !impacted.contains(&line) {
                     impacted.push(line);
@@ -116,7 +115,24 @@ fn run_check_impact(file: &str) -> Result<()> {
         }
     }
 
-    impacted.dedup();
+    // Check notes that reference the file path directly
+    for entry in index.vault_notes.iter() {
+        let note = entry.value();
+        for file_ref in &note.file_refs {
+            if !dt_index::vault::ref_matches_path(&file_ref.path, &abs_path) {
+                continue;
+            }
+            let line = format!(
+                "  - {} [{}] has file reference to `{}`",
+                note.title,
+                note.note_type,
+                file_ref.path.display()
+            );
+            if !impacted.contains(&line) {
+                impacted.push(line);
+            }
+        }
+    }
 
     if !impacted.is_empty() {
         println!(
@@ -172,9 +188,10 @@ fn run_validate_note(note: &str) -> Result<()> {
     for link in &vault_note.wikilinks {
         let linked_path = vault_root.join(format!("{link}.md"));
         if !linked_path.exists() {
-            let found = index.vault_notes.iter().any(|e| {
-                e.value().title.eq_ignore_ascii_case(link)
-            });
+            let found = index
+                .vault_notes
+                .iter()
+                .any(|e| e.value().title.eq_ignore_ascii_case(link));
             if !found {
                 issues.push(format!("  - BROKEN WIKILINK: [[{link}]]"));
             }
@@ -208,8 +225,23 @@ fn run_coverage() -> Result<()> {
 
     let total_notes = index.vault_notes.len();
     let total_code = index.code_symbols.len();
-    let linked = index.doc_to_syms.len();
-    let total_links: usize = index.sym_to_docs.iter().map(|e| e.value().len()).sum();
+    // Fuzzy title guesses are excluded — they'd otherwise inflate the one
+    // number a user sees at every session start.
+    let linked = index
+        .doc_to_syms
+        .iter()
+        .filter(|e| e.value().iter().any(|r| r.confidence.is_verified()))
+        .count();
+    let total_links: usize = index
+        .sym_to_docs
+        .iter()
+        .map(|e| {
+            e.value()
+                .iter()
+                .filter(|d| d.confidence.is_verified())
+                .count()
+        })
+        .sum();
     let coverage = if total_notes > 0 {
         (linked as f64 / total_notes as f64 * 100.0) as u32
     } else {
@@ -300,19 +332,40 @@ fn setup_hooks() -> Result<()> {
     let settings_dir = root.join(".claude");
     let settings_path = settings_dir.join("settings.json");
 
-    // Read existing settings or start fresh
+    // Read existing settings or start fresh. A settings file we can't parse is
+    // the user's, not ours — refuse rather than silently replacing it.
     let mut settings: serde_json::Value = if settings_path.exists() {
         let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content).map_err(|e| {
+                anyhow::anyhow!(
+                    "{} is not valid JSON ({e}) — fix or remove it, then re-run --setup-hooks",
+                    settings_path.display()
+                )
+            })?
+        }
     } else {
         serde_json::json!({})
     };
 
-    let hooks = settings
-        .as_object_mut()
-        .unwrap()
+    let Some(root_obj) = settings.as_object_mut() else {
+        anyhow::bail!(
+            "{} must contain a JSON object at the top level",
+            settings_path.display()
+        );
+    };
+
+    let hooks = root_obj
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        anyhow::bail!(
+            "{} has a non-object `hooks` entry — refusing to overwrite it",
+            settings_path.display()
+        );
+    }
 
     // Use the binary name on PATH, not an absolute path — absolute paths
     // break across users and machines when hooks are committed to git.
@@ -342,40 +395,28 @@ fn setup_hooks() -> Result<()> {
         }]
     });
 
-    // Merge SessionStart — append if no doctrack hook exists yet
-    let session_start = hooks
-        .as_object_mut()
-        .unwrap()
-        .entry("SessionStart")
-        .or_insert_with(|| serde_json::json!([]));
+    // Merge each event — append only if no doctrack hook exists there yet
+    for (event, hook) in [
+        ("SessionStart", session_start_hook),
+        ("PostToolUse", post_tool_hook),
+    ] {
+        let hooks_obj = hooks
+            .as_object_mut()
+            .expect("checked to be an object above");
+        let entry = hooks_obj
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]));
 
-    let has_doctrack_session = session_start
-        .as_array()
-        .map(|arr| arr.iter().any(|h| {
-            h.to_string().contains("doctrack")
-        }))
-        .unwrap_or(false);
+        let Some(arr) = entry.as_array_mut() else {
+            anyhow::bail!(
+                "{} has a non-array `hooks.{event}` entry — refusing to overwrite it",
+                settings_path.display()
+            );
+        };
 
-    if !has_doctrack_session {
-        session_start.as_array_mut().unwrap().push(session_start_hook);
-    }
-
-    // Merge PostToolUse — append if no doctrack hook exists yet
-    let post_tool = hooks
-        .as_object_mut()
-        .unwrap()
-        .entry("PostToolUse")
-        .or_insert_with(|| serde_json::json!([]));
-
-    let has_doctrack_post = post_tool
-        .as_array()
-        .map(|arr| arr.iter().any(|h| {
-            h.to_string().contains("doctrack")
-        }))
-        .unwrap_or(false);
-
-    if !has_doctrack_post {
-        post_tool.as_array_mut().unwrap().push(post_tool_hook);
+        if !arr.iter().any(|h| h.to_string().contains("doctrack")) {
+            arr.push(hook);
+        }
     }
 
     // Write back

@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use tower_lsp::lsp_types::*;
 
 use dt_index::Index;
@@ -8,7 +6,7 @@ use dt_index::Index;
 pub fn handle_hover(index: &Index, params: HoverParams) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
-    let path = PathBuf::from(uri.path());
+    let path = uri.to_file_path().ok()?;
 
     // For code files: find the symbol at the cursor position and show linked docs
     if let Some(symbols) = index.code_symbols.get(&path) {
@@ -22,9 +20,16 @@ pub fn handle_hover(index: &Index, params: HoverParams) -> Option<Hover> {
                     content.push_str("**Documented in:**\n\n");
 
                     for doc in &docs {
+                        // Fuzzy links are title-similarity guesses. Say so
+                        // rather than presenting them as documentation.
+                        let hint = if doc.confidence.is_verified() {
+                            String::new()
+                        } else {
+                            format!(" _({} match)_", doc.confidence)
+                        };
                         content.push_str(&format!(
-                            "- **{}** ({}): {}\n",
-                            doc.note_title, doc.note_type, doc.context
+                            "- **{}** ({}): {}{}\n",
+                            doc.note_title, doc.note_type, doc.context, hint
                         ));
                     }
 
@@ -50,7 +55,7 @@ pub fn handle_hover(index: &Index, params: HoverParams) -> Option<Hover> {
             let mut content = String::from("### Linked code symbols\n\n");
             for sym_ref in &refs {
                 content.push_str(&format!(
-                    "- `{}` in `{}` ({:?})\n",
+                    "- `{}` in `{}` ({} match)\n",
                     sym_ref.symbol_id.name,
                     sym_ref.symbol_id.file.display(),
                     sym_ref.confidence

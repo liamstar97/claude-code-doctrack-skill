@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -49,20 +49,33 @@ impl FileWatcher {
         tokio::task::spawn_blocking(move || {
             let (notify_tx, notify_rx) = std::sync::mpsc::channel();
 
-            let mut debouncer = new_debouncer(Duration::from_millis(500), notify_tx)
-                .expect("failed to create debouncer");
+            // A watcher that can't start is a degraded index, not a reason to
+            // take down the MCP or LSP server that spawned this thread.
+            let mut debouncer = match new_debouncer(Duration::from_millis(500), notify_tx) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("failed to create file watcher: {e}");
+                    return;
+                }
+            };
 
             // Watch the vault directory
-            debouncer
+            if let Err(e) = debouncer
                 .watcher()
                 .watch(&vault_root, notify::RecursiveMode::Recursive)
-                .expect("failed to watch vault directory");
+            {
+                warn!("failed to watch vault {}: {e}", vault_root.display());
+                return;
+            }
 
-            // Watch the project root (non-recursive — we'll filter by known files)
-            debouncer
+            // Watch the project root recursively — events are filtered by path below
+            if let Err(e) = debouncer
                 .watcher()
                 .watch(&project_root, notify::RecursiveMode::Recursive)
-                .expect("failed to watch project directory");
+            {
+                warn!("failed to watch project {}: {e}", project_root.display());
+                return;
+            }
 
             info!(
                 "watching vault={} project={}",
@@ -80,24 +93,28 @@ impl FileWatcher {
 
                             let path = &event.path;
 
+                            // Obsidian churns through .obsidian/ and .trash/ as
+                            // you browse; those aren't notes.
                             if path.starts_with(&vault_root) {
-                                if is_markdown(path) {
+                                if is_markdown(path) && !dt_index::vault::is_vault_internal(path) {
                                     if path.exists() {
                                         debug!("vault note changed: {}", path.display());
                                         let _ = index.reindex_note(path);
                                         let _ = tx.send(WatchEvent::VaultNoteChanged(path.clone()));
                                     } else {
                                         debug!("vault note removed: {}", path.display());
+                                        index.remove_note(path);
                                         let _ = tx.send(WatchEvent::VaultNoteRemoved(path.clone()));
                                     }
                                 }
-                            } else if is_code_file(path) {
+                            } else if dt_index::symbols::is_supported(path) {
                                 if path.exists() {
                                     debug!("code file changed: {}", path.display());
                                     let _ = index.reindex_code_file(path);
                                     let _ = tx.send(WatchEvent::CodeFileChanged(path.clone()));
                                 } else {
                                     debug!("code file removed: {}", path.display());
+                                    index.remove_code_file(path);
                                     let _ = tx.send(WatchEvent::CodeFileRemoved(path.clone()));
                                 }
                             }
@@ -116,14 +133,4 @@ impl FileWatcher {
 
 fn is_markdown(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "md")
-}
-
-fn is_code_file(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    matches!(
-        ext,
-        "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "java" | "c" | "cpp" | "cc" | "h" | "hpp"
-    )
 }

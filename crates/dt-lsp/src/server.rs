@@ -22,9 +22,10 @@ pub struct DoctrackServer {
 
 impl DoctrackServer {
     pub fn new(client: Client) -> Self {
-        let index = Arc::new(ArcSwap::from_pointee(
-            Index::new(PathBuf::new(), PathBuf::new()),
-        ));
+        let index = Arc::new(ArcSwap::from_pointee(Index::new(
+            PathBuf::new(),
+            PathBuf::new(),
+        )));
         Self { client, index }
     }
 }
@@ -34,31 +35,43 @@ impl LanguageServer for DoctrackServer {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         info!("doctrack-lsp initializing");
 
-        if let Some(folders) = &params.workspace_folders {
-            if let Some(folder) = folders.first() {
-                let root = PathBuf::from(folder.uri.path());
-                let vault_root = root.join(".doctrack");
+        if let Some(folders) = &params.workspace_folders
+            && let Some(folder) = folders.first()
+        {
+            // `uri.path()` is percent-encoded: a workspace at
+            // "/home/me/My Project" would come back as ".../My%20Project"
+            // and every path built from it would miss.
+            let Ok(root) = folder.uri.to_file_path() else {
+                info!("workspace folder is not a local path: {}", folder.uri);
+                return Ok(InitializeResult {
+                    capabilities: capabilities::server_capabilities(),
+                    server_info: Some(ServerInfo {
+                        name: "doctrack-lsp".to_string(),
+                        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    }),
+                });
+            };
+            let vault_root = root.join(".doctrack");
 
-                if vault_root.exists() {
-                    info!("found vault at {}", vault_root.display());
+            if vault_root.exists() {
+                info!("found vault at {}", vault_root.display());
 
-                    let new_index = Index::new(root.clone(), vault_root.clone());
-                    if let Err(e) = new_index.build() {
-                        info!("index build error: {e}");
-                    }
-
-                    // Atomically swap in the built index
-                    self.index.store(Arc::new(new_index));
-
-                    // Start file watcher with shared index and client
-                    let index = self.index.clone();
-                    let client = self.client.clone();
-                    tokio::spawn(async move {
-                        run_watcher(index, client, vault_root, root).await;
-                    });
-                } else {
-                    info!("no .doctrack/ vault found in workspace");
+                let new_index = Index::new(root.clone(), vault_root.clone());
+                if let Err(e) = new_index.build() {
+                    info!("index build error: {e}");
                 }
+
+                // Atomically swap in the built index
+                self.index.store(Arc::new(new_index));
+
+                // Start file watcher with shared index and client
+                let index = self.index.clone();
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    run_watcher(index, client, vault_root, root).await;
+                });
+            } else {
+                info!("no .doctrack/ vault found in workspace");
             }
         }
 
@@ -96,7 +109,7 @@ impl LanguageServer for DoctrackServer {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let index = self.index.load();
         let uri = params.text_document.uri;
-        let path = PathBuf::from(uri.path());
+        let Ok(path) = uri.to_file_path() else { return };
 
         if !index.code_symbols.contains_key(&path) {
             let _ = index.reindex_code_file(&path);
@@ -111,7 +124,7 @@ impl LanguageServer for DoctrackServer {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let index = self.index.load();
         let uri = params.text_document.uri;
-        let path = PathBuf::from(uri.path());
+        let Ok(path) = uri.to_file_path() else { return };
 
         if path.starts_with(&index.vault_root) {
             let _ = index.reindex_note(&path);
@@ -153,7 +166,7 @@ async fn run_watcher(
                     }
                     WatchEvent::VaultNoteRemoved(path) => {
                         info!("vault note removed: {}", path.display());
-                        idx.vault_notes.remove(path);
+                        idx.remove_note(path);
                         if let Ok(uri) = Url::from_file_path(path) {
                             client.publish_diagnostics(uri, vec![], None).await;
                         }
@@ -163,7 +176,7 @@ async fn run_watcher(
                     }
                     WatchEvent::CodeFileRemoved(path) => {
                         info!("code file removed: {}", path.display());
-                        idx.code_symbols.remove(path);
+                        idx.remove_code_file(path);
                     }
                 }
             }

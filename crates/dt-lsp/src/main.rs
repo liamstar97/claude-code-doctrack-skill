@@ -40,9 +40,7 @@ async fn main() -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| {
-        DoctrackServer::new(client)
-    });
+    let (service, socket) = LspService::new(DoctrackServer::new);
 
     Server::new(stdin, stdout, socket).serve(service).await;
 
@@ -73,7 +71,11 @@ fn run_check(project_path: &str) -> Result<()> {
     println!("Vault Notes ({} total)", index.vault_notes.len());
     println!("{}", "-".repeat(60));
 
-    let mut notes: Vec<_> = index.vault_notes.iter().map(|e| e.value().clone()).collect();
+    let mut notes: Vec<_> = index
+        .vault_notes
+        .iter()
+        .map(|e| e.value().clone())
+        .collect();
     notes.sort_by(|a, b| a.title.cmp(&b.title));
 
     for note in &notes {
@@ -100,7 +102,10 @@ fn run_check(project_path: &str) -> Result<()> {
         for sym in symbols {
             println!(
                 "    {} {} (L{}-L{})",
-                sym.kind, sym.name, sym.start_line + 1, sym.end_line + 1
+                sym.kind,
+                sym.name,
+                sym.start_line + 1,
+                sym.end_line + 1
             );
         }
     }
@@ -160,7 +165,11 @@ fn run_check(project_path: &str) -> Result<()> {
                     "  STALE: {} references `{}`{} — not found",
                     note.title,
                     file_ref.path.display(),
-                    if file_ref.is_bare_filename { " (bare filename)" } else { "" }
+                    if file_ref.is_bare_filename {
+                        " (bare filename)"
+                    } else {
+                        ""
+                    }
                 );
                 stale_count += 1;
             } else {

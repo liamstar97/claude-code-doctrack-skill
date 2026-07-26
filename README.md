@@ -34,28 +34,82 @@ Notes are connected via `[[wikilinks]]` and visualized in Obsidian's graph view.
 
 ## Installation
 
-### Project-local (recommended)
+Doctrack has two parts. The **skill** is required; the **binaries** are optional
+but unlock the code↔doc index, editor integration, and the `doctrack refresh`
+workflow.
 
-Install for a single project. Shared with your team via git:
+### 1. The skill
+
+Project-local (recommended — shared with your team via git):
 
 ```bash
 # From your project root
-mkdir -p .claude/skills/doctrack
-curl -L https://github.com/liamstar97/claude-code-doctrack-skill/releases/latest/download/doctrack.skill \
-  -o /tmp/doctrack.skill && unzip -o /tmp/doctrack.skill -d .claude/skills/ && rm /tmp/doctrack.skill
+mkdir -p .claude/skills
+git clone --depth 1 https://github.com/liamstar97/doctrack /tmp/doctrack \
+  && cp -r /tmp/doctrack/skills/doctrack .claude/skills/ \
+  && rm -rf /tmp/doctrack
 ```
 
-Commit `.claude/skills/doctrack/` to your repo. Claude Code discovers project-local skills automatically.
+Commit `.claude/skills/doctrack/` to your repo. Claude Code discovers
+project-local skills automatically. For all your projects instead, copy into
+`~/.claude/skills/` and don't commit anything.
 
-### User-global
+### 2. The binaries (optional)
 
-Install for all your projects:
+Requires [Rust](https://rustup.rs).
 
 ```bash
-mkdir -p ~/.claude/skills/doctrack
-curl -L https://github.com/liamstar97/claude-code-doctrack-skill/releases/latest/download/doctrack.skill \
-  -o /tmp/doctrack.skill && unzip -o /tmp/doctrack.skill -d ~/.claude/skills/ && rm /tmp/doctrack.skill
+cargo install --git https://github.com/liamstar97/doctrack dt-mcp   # doctrack-mcp
+cargo install --git https://github.com/liamstar97/doctrack dt-lsp   # doctrack-lsp
 ```
+
+`doctrack init` installs `doctrack-mcp` for you when `cargo` is on PATH, so you
+can skip this. `doctrack-mcp --update` reinstalls both from `main`.
+
+## The code↔doc index
+
+`doctrack-mcp` maintains a bidirectional index between your source symbols
+(parsed with tree-sitter) and your vault notes, and exposes it to Claude Code as
+MCP tools:
+
+| Tool | Purpose |
+|------|---------|
+| `docs_for_file` | Which notes document a given source file |
+| `check_impact` | After changing a file, which notes may need updating |
+| `resolve_symbol` | Where a symbol is defined, and what documents it |
+| `validate_note` | Stale file refs, ambiguous paths, broken wikilinks |
+| `refresh_docs` | Prioritized plan of documentation that has drifted |
+| `coverage_report` | Vault health: notes, links, stale refs, undocumented files |
+| `stale_report` | Every broken reference across the vault |
+| `search_index` | Fuzzy search across notes, symbols, and paths |
+
+Links are graded by confidence. `Exact` comes from a file reference that
+resolves, `Strong` from a backtick identifier matching a parsed symbol, and
+`Fuzzy` from title similarity. Coverage numbers and impact reports count only
+the first two — a fuzzy guess is shown as a hint, never as documentation.
+
+Supported languages: Rust, TypeScript, JavaScript, Python, Go, Java, C, C++.
+
+The same commands are available one-shot from the terminal:
+
+```bash
+doctrack-mcp --coverage
+doctrack-mcp --check-impact src/auth/session.rs
+doctrack-mcp --validate-note features/auth.md
+doctrack-mcp --setup-hooks     # SessionStart + PostToolUse hooks for Claude Code
+doctrack-mcp --help
+```
+
+`DOCTRACK_ROOT` overrides the project root (defaults to the working directory).
+`DOCTRACK_MAX_INDEXED_FILES` caps how many source files a build will parse.
+
+### Editor integration
+
+`doctrack-lsp` is a language server that surfaces the same index in your editor:
+hover over a symbol to see the notes documenting it, and go-to-definition to jump
+between code and docs. Point your editor's LSP client at the `doctrack-lsp`
+binary. `doctrack-lsp --check /path/to/project` dumps the whole index, which is
+the fastest way to see what doctrack thinks your vault says.
 
 ## Getting started
 
@@ -132,10 +186,11 @@ Doctrack depends on the **obsidian skill** ([bitbonsai/mcpvault](https://github.
 
 ## How it works
 
-Doctrack is two skills working together:
+Doctrack is two skills and an indexer working together:
 
 1. **Doctrack** (this skill) — Defines the knowledge graph schema: what notes to create, what frontmatter, what wikilinks, what tags. It's the brain that decides what to document.
 2. **Obsidian skill** (mcpvault) — Handles the mechanics of reading and writing to the Obsidian vault via MCP tools. It's the hands that do the I/O.
+3. **`doctrack-mcp`** (optional) — Parses your source with tree-sitter and keeps a bidirectional index between code symbols and vault notes, so Claude can tell which docs a change affects instead of guessing.
 
 When Claude starts a session, doctrack detects `.doctrack/`, reads the project config, and loads relevant context. When code changes, doctrack decides which notes to update and delegates the writes to the obsidian skill.
 
@@ -147,6 +202,12 @@ The `.doctrack/` vault is committed to git, so the knowledge graph is shared wit
 - Project config uses append-only mode to avoid conflicts
 - Advisory locking via frontmatter prevents concurrent edits to the same note
 - Post-task reconciliation consolidates changes
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the repository layout and workflow,
+and [docs/ANALYSIS.md](docs/ANALYSIS.md) for architecture notes and the
+known-issue backlog.
 
 ## License
 
